@@ -1,0 +1,406 @@
+# Resident Agent Framework — 所有参数都在此配置，代码里无隐藏默认值。
+# 本文件随仓库分发、不含个人私密信息：敏感/环境相关值一律用环境变量引用，
+# 实际值填在 .env（见 .env.example；.env 已被 .gitignore 忽略，不会入库）。
+runtime:
+  name: resident
+  data_dir: ./data
+  # Agent 认知流唯一真相源（JSONL）
+  context_file: ./data/context.jsonl
+  # 压缩归档目录（context 超限时旧 jsonl 移到这里）
+  compressed_dir: ./data/compressed
+  log_level: INFO
+  log_format: text
+
+# os.db：系统持久化数据库
+database:
+  path: ./data/os.db
+
+# todos：待办树持久化（JSON 文件，重启存活）
+todos:
+  file: ./data/todos.json
+
+# messages_tools：消息查询工具阈值（agent 侧）
+messages_tools:
+  # messages_query：只读 SQL 返回行数上限
+  query_max_rows: 200
+  # messages_conversations：每会话最新消息条数 / 单条 content 截断字符
+  list_latest: 5
+  content_max_chars: 300
+  # messages_unread：每会话未读返回条数
+  unread_latest: 20
+  # messages_threads：会话列表上限
+  list_threads_limit: 200
+  # messages_range：单条 content 截断 / 返回条数上限
+  range_max_chars: 10000
+  range_limit: 200
+  # messages_detail：单条消息字符上限，超限整体拒绝
+  detail_max_chars: 10000
+  # messages_clear_unread：返回被清除消息的最近条数
+  clear_show: 10
+  # messages_download：导出目录（宿主侧，挂载进容器 /home/sandbox/download）
+  download_dir: ./data/workspace/download
+
+# agent：框架行为参数（全部来自配置）
+agent:
+  # 工具执行总超时（秒）
+  tool_timeout_seconds: 60
+  # 工具结果通用字符上限（兜底）：任何工具输出超过该长度即截断并把
+  # 完整结果落盘（防个别工具忘记自身截断把上下文撑爆）
+  tool_result_max_chars: 50000
+  # idle 见事件后：不取事件，先切成 streaming，sleep 该时长再批量取出
+  event_batch_wait_seconds: 0.5
+  # 每轮调用前检查上下文最新 N 条是否符合后端规范（不合规修复/替换）
+  repair_latest_n: 5
+  # user 消息合并策略（一批内的多条 user 事件合并为一条）
+  user_merge:
+    enabled: true
+    separator: "\n\n---\n\n"
+    notice: "[系统提示] 以下为本次批内合并的多条消息，请注意逐条回应。"
+  # 自说自话检测：非工具调用的 model 文本累计超过该字符数 → 触发一条 notice
+  # 提醒 agent（触发后缓存清空，下次提醒新内容）
+  model_output_threshold_chars: 800
+  # 自说自话提醒中每条内容截断的字符数（[1]string[:x]）
+  model_output_line_max_chars: 100
+  # 未读统计窗口（小时）：窗口外的未读视为已读（不携带、不统计、不唤醒）
+  unread_window_hours: 1
+  # 每会话未读上限：超过该数量之前的未读视为已读（防历史积压反复打扰）
+  unread_max_per_session: 99
+  # LLM 调用失败（重试耗尽）后，把本轮事件重新入队、下次重试前的等待
+  # 秒数。>0 防止偶发失败时热循环重试刷 LLM；0 表示立即重试。
+  llm_failed_backoff_seconds: 2.0
+  # 永久性 LLM 故障（400/401/403/404/422 等配置性错误，客户端不重试）
+  # 连续多少次后进入隔离态：只打一条 ERROR + `llm_unavailable` 事件，
+  # 队列事件保留，按下方间隔低频探测；配置修复后自动恢复。0 = 关闭隔离。
+  llm_permanent_fail_threshold: 10
+  # 隔离态的探测间隔（秒）
+  llm_permanent_fail_backoff_seconds: 60
+  # 图片事件入队字节准入：带图片块的事件在 push 前校验
+  # 「context.jsonl 当前字节 + 队列中待处理事件字节 + 本事件字节」是否
+  # 超过本上限，超过则拒绝添加（HTTP /api/event 返回 413）。
+  # 只约束含图事件；纯文本沿用既有 token 压缩机制（避免通知推送被拒）。
+  # 后端对请求体大小无限制（多大都接受）且单请求图片数上限 20；本地
+  # base64 模式（readimage.mode=local）按 20 张 × max_base64_bytes
+  # （≈7.9MB）+ 文本余量取 12MB，使一个上下文窗口内最多可携带 20 张图。
+  context_max_bytes: 12000000
+
+# readimage：原生识图工具（本地 venv + Pillow，不调用沙箱）。
+# 调用时读取工作区图片 → 解码校验 → 按字节预算压缩 → 入队（下一轮可见）。
+readimage:
+  # false 则不注册 readimage 工具
+  enabled: true
+  # 图片来源模式：local = base64 内联入队（受 context_max_bytes 约束）；
+  # imgbed = 压缩后上传图床，队列只放 URL（需 imgbed.enabled=true）
+  mode: local
+  # 原图字节上限（读入前检查，超过直接失败）
+  max_input_bytes: 20971520
+  # 压缩时长边上限（像素）
+  max_edge: 2048
+  # JPEG 初始质量 / 最低质量（逐级下降）
+  jpeg_quality: 85
+  quality_floor: 40
+  # 单图 base64 字节上限（目标 = min(本值, 原图 base64, 上下文剩余预算)）
+  max_base64_bytes: 393216
+  # 可接受的最小 base64；剩余预算低于此值直接失败并提示等待压缩
+  min_base64_bytes: 16384
+  # 预算预检的保守包装开销（text + image 块包装；权威校验在 push_event）
+  block_overhead_bytes: 512
+  # 是否允许读取外部 http(s) 图片（下载后走同一压缩/入队流程）
+  allow_url: true
+  # SSRF 防护：false 时拒绝回环/内网/链路本地/保留地址（含重定向最终地址）
+  allow_private_hosts: false
+  # 外部图片下载超时（秒）
+  url_timeout_seconds: 30
+
+# imgbed：通用图床客户端（readimage 图床模式 + 前端上传图片）。
+# 不同图床的鉴权头/表单字段/返回链接字段可能不同，全部可配置。
+imgbed:
+  # false 则禁用图床（readimage.mode 必须为 local）
+  enabled: false
+  # 上传接口完整地址；内核可直达的本地地址或公网地址均可
+  # （如 http://127.0.0.1:3003/api/upload 或 https://your-imgbed.example.com/api/upload）
+  upload_url: https://your-imgbed.example.com/api/upload
+  # 请求 key（密钥走 .env，绝不入库/入 git）
+  api_key: ${IMGBED_API_KEY}
+  # 鉴权头名（该服务为 X-Api-Key；有的图床用 Authorization）
+  api_key_header: X-Api-Key
+  # multipart 表单字段名（该服务支持 file/image/smfile）
+  form_field: file
+  # 返回链接在响应 JSON 里的字段名，支持点路径（如 url / data.url / link）
+  response_url_field: url
+  # 上传请求超时（秒）。单次 socket 操作超时；实测正常上传 ~0.5s，
+  # 偶发连接挂起时快速失败交给重试（15s×3 + 退避 < 工具 60s 上限）
+  timeout_seconds: 15
+  # 网络类瞬时错误（EOF/超时/reset）额外重试次数（总尝试 = retries + 1）
+  retries: 2
+
+# wake：主动唤醒（agent 线程维护概率：本轮有工具调用 → 恢复 initial；
+# 无工具调用 → 减半至下限 min；唤醒后冷却到 min）
+wake:
+  initial_probability: 0.01
+  min_probability: 0.001
+  # 未读加权唤醒：有效概率 = p * e^(unread_weight * 未读数)，封顶 1.0
+  unread_weight: 0.05
+  # 唤醒携带的最大会话数（其余会话提示"本次系统暂未携带"）
+  wake_x_convs: 10
+  # 唤醒中每条消息内容最大字符数
+  wake_max_chars: 2000
+  # 每会话展示最新一条：最早 + 本会话绝对最新（任何方向/已读状态，
+  # 含自己发的 out 消息），用于给 agent 当前对话状态
+  inject_latest: true
+  # 自由活动窗口（无新未读的主动唤醒）是否附带各会话最新消息预览；
+  # 每会话最新一条（无条件，含自己发送的 out 消息），仅作了解，不标记已读
+  free_preview_enabled: true
+  # 自由活动窗口预览的会话数上限 x（按最新 seq 取前 x 个会话）
+  free_preview_sessions: 5
+  # 唤醒去重：唤醒后冷却窗口内不重复概率唤醒（紧急唤醒不受限）
+  wake_dedup: true
+  wake_cooldown_seconds: 60
+  # 唤醒消息的引导语（整段前缀，置于唤醒内容之前）
+  wake_notice_prefix: "这是系统目前已连接的消息适配器推送的消息，请注意查收，可以不回复，但至少要看看是什么消息，了解原委，毕竟这是你与外接交互的一个渠道"
+  # 消息补充引导语：目标会话在 agent 事件队列里已有事件（上一轮唤醒通知
+  # 还没被合并）时，不再重复完整唤醒，只补推新到的（有人找你）消息；
+  # 该通知不带标准开头/结尾
+  wake_supplement_prefix: "（消息补充）以下只列新到、尚未在等待队列中出现过的（有人找你）消息；其余消息已在队列中，无需重复查看"
+  # 主动唤醒且无未读时，注入该 md 文件内容提醒 agent（可保持静默）。
+  # 属 schedule 域，与 agent 提示词目录（config/prompt/）分开。
+  no_message_prompt_file: config/schedule/awake_no_message.md
+
+# beat：kernel 世界时钟 / 调度循环（每 interval_seconds tick 一次）
+beat:
+  enabled: true
+  # tick 间隔（秒）
+  interval_seconds: 5
+  # 定时任务：消息归档间隔（小时）
+  archive_interval_hours: 24
+  # 定时任务：归档多少天前的已读消息（未读永不归档）
+  archive_days: 30
+
+# events_port：独立事件端口（另一个端口，向 kernel 添加事件的投递通道）。
+# 事件类型（kind）暂未定义，后续扩展；当前只把事件送入 beat 事件队列。
+events_port:
+  # false 则不启动事件端口
+  enabled: true
+  host: 127.0.0.1
+  port: 18087
+  # 事件端口独立鉴权密钥（与 http.api_key 分离；复用同一环境变量）
+  api_key: ${RESIDENT_API_KEY}
+
+# prompt：提示词加载。
+# 框架加载顺序 = ①一句话概括项目（项目名+真实模型+用户目录）→
+#               ②下面 prompt.files 索引的文件（按此顺序拼接）→
+#               ③工具定义（自动从已注册工具生成）。
+# 目录分两类：system/（系统/框架层定义，别乱改）与
+#            user/（用户自定义，可自由修改）。
+prompt:
+  directory: config/prompt
+  files:
+    - system/kernel.md
+    # 用户自定义提示词：user/persona.md 是一份示例，按需修改或扩展
+    - user/persona.md
+
+# workspace：agent 的工作环境（宿主 ↔ 容器单挂载映射）
+workspace:
+  # 宿主侧工作区根目录（相对配置文件的路径按启动 CWD 解析）
+  host_root: ./data/workspace
+  # 容器内实际的用户工作目录（提示词里会告诉 agent，也是转换的容器侧根）
+  container_path: /home/sandbox
+
+# skills：SKILL.md 包（data/workspace/.skills/<name>/SKILL.md）
+# 启动时扫描清单（name/description）进系统提示，skills_load 工具按需加载全文
+skills:
+  enabled: true
+  directory: ./data/workspace/.skills
+  # 管理界面（前端「技能」视图）安装限制
+  # zip 原始大小上限（字节；同时受 http.max_body_bytes 约束）
+  install_max_zip_bytes: 10485760
+  # 解压后总大小上限 / 文件数上限
+  install_max_total_bytes: 52428800
+  install_max_files: 500
+  # SKILL.md 预览返回的字符上限
+  detail_max_chars: 200000
+  # 覆盖同名 skill 时旧版备份目录 / 删除时回收目录
+  # （放 data/ 下，不进 agent 工作区，agent 看不到）
+  backup_dir: ./data/skill_backups
+  trash_dir: ./data/skill_trash
+
+# email：kernel 内置邮件通道（紧急逃生通道——即使容器/docker 挂了，
+# 只要 kernel 存活，agent 就能用 email 收发）。enabled=false 时不注册工具。
+email:
+  enabled: false
+  imap:
+    host: imap.qq.com
+    port: 993
+    ssl: true
+    username: you@example.com
+    password: ${EMAIL_IMAP_PASSWORD}
+  smtp:
+    host: smtp.qq.com
+    port: 465
+    ssl: true
+    username: you@example.com
+    password: ${EMAIL_SMTP_PASSWORD}
+
+# workspace_tools：工作区工具（exec/exec_async + read/edit/replace/glob/grep）
+# 所有阈值均来自本段，代码中无隐藏默认值。
+workspace_tools:
+  # false 则完全不注册 workspace 工具（无 docker 环境可用）
+  enabled: true
+  # 执行模式：sandbox=命令与文件操作全部经容器 exec（沙箱内路径天然隔离，
+  # 不做路径检查，可访问 /tmp 等容器内任意路径）；host=直接用本机系统
+  # bash/python（宿主机模式为后续开发内容，安全限制待实现）。
+  mode: sandbox
+  # docker exec 目标容器（由 scripts/start.sh 或 compose 创建；host 模式忽略）
+  container: resident-sandbox
+  # workspace_exec：前台默认超时（不传 timeout 时），超时引导转 async
+  exec_default_timeout_seconds: 10
+  # workspace_exec：前台实际等待 = min(timeout, 该上限)——前台 exec 本质是
+  # 阻塞等待，只适合短命令；agent 传再大的 timeout 也会被截断到这里。
+  # 长任务一律用 workspace_exec_async。
+  exec_max_timeout_seconds: 60
+  # workspace_exec：stdout/stderr 返回截断上限（防大输出撑爆上下文）
+  exec_output_max_chars: 20000
+  # 截断内容缓存目录（超长输出的完整内容落盘，容器内可读，不丢弃）
+  truncated_dir: ./data/workspace/.truncated
+  # workspace_exec_async：后台任务超时（worker 线程）
+  exec_async_timeout_seconds: 600
+  # workspace_exec_async：后台 worker 线程数（队列消费，防任务风暴）
+  exec_async_workers: 2
+  # workspace_exec_async：任务结果落盘目录（<task_id>.json）。
+  # 必须位于 workspace.host_root 内（挂载到容器 /home/sandbox），
+  # agent 才能用 workspace_read 读到容器侧路径（/home/sandbox/.tasks_log/…）。
+  exec_async_log_dir: ./data/workspace/.tasks_log
+  # 文件操作（read/edit/replace/append/write/glob/grep/rm）单次执行超时（秒）
+  fs_timeout_seconds: 60
+  # workspace_read：单次读取字节上限，超限抛错（比截断省 token）
+  read_max_bytes: 65535
+  # workspace_read：行数上限，超限抛错（防大文件整读耗尽上下文）
+  read_max_lines: 1000
+  # workspace_read：超过该字节数时返回提示（完整读取但提醒占用上下文）
+  read_warn_bytes: 32768
+  # workspace_read：行号默认开关（show_line_numbers 参数可覆盖）
+  read_default_line_numbers: true
+  # workspace_glob：结果数量上限，超出截断并提示
+  glob_max_results: 100
+  # workspace_glob：调用方超时预算（秒），防大目录卡住（工具整体仍受
+  # agent.tool_timeout_seconds 兜底）
+  glob_timeout_seconds: 10
+  # workspace_grep：匹配结果行数上限（防上下文膨胀），参数可覆盖
+  grep_head_limit: 250
+  # workspace_grep：单行输出最大列数（防 base64/压缩内容刷屏）
+  grep_max_columns: 500
+  # workspace_edit：old_string 长度上限（防超大匹配串）
+  edit_max_old_chars: 20000
+  # edit/replace 返回字符串（diff）最大字节：超限截断并附省略提示
+  # （返回的是改动区 diff 不占上下文；文件本身不限制大小）
+  edit_output_max_chars: 20000
+  # workspace_append：追加内容字节上限
+  write_max_bytes: 262144
+  # workspace_rm：两步确认清单显示上限（超出部分完整落盘 truncated_dir）
+  rm_max_entries: 200
+  # workspace_rm：确认 uuid 有效期（秒）
+  rm_confirm_ttl_seconds: 600
+
+# http：流式接口（前端 SSE 看模型流式输出）
+http:
+  host: 127.0.0.1
+  port: 18086
+  # kernel HTTP 接口鉴权密钥（前端经 console 代理访问，此 key 由 console 注入）
+  api_key: ${RESIDENT_API_KEY}
+  # StreamBus 历史上限：前端刷新时先回放最近事件再跟实时流
+  stream_history: 200
+  # SSE 心跳秒：空闲连接不被代理掐断
+  stream_heartbeat: 15
+  # HTTP 请求体上限（字节）：图床模式下前端上传原图走 /api/image，
+  # 需要放开 aiohttp 默认的 1MB；/api/event 的大 payload 仍由 Agent 的
+  # 字节准入（agent.context_max_bytes）做业务级拒绝
+  max_body_bytes: 20971520
+  # 进程退出（重启/停机）时 runner 等待在途请求收尾的上限（秒）：
+  # SSE 长连接会先被 bus.close() 主动结束，此值只兜底慢客户端
+  shutdown_timeout_seconds: 5
+
+# model：LLM 协议/变体
+llm:
+  # 协议：openai-compatible | anthropic | openai
+  protocol: openai-compatible
+  # openai 体系细分配适配变体：generic | openai | deepseek | qwen | glm
+  variant: deepseek
+  base_url: ${LLM_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  model: ${LLM_MODEL}
+  timeout_seconds: 600
+  retries: 2
+  retry_delay_seconds: 1.5
+  # 指数退避：delay * backoff_base^attempt，退避上限 cap_seconds
+  backoff_base: 2.0
+  retry_cap_seconds: 60.0
+  # 若请求以 role=tool 结尾，补一条空 user 消息（部分后端不支持 tool 结尾）
+  # trailing_empty_user: true
+  trailing_empty_user: false
+  # 请求 User-Agent（网关按项目标识识别流量；不要用通用 SDK 名）
+  user_agent: resident-agent/1.0
+  # 模型支持的输入模态（text / image）。声明 image 后，上下文里的图片块
+  # 才会原生发给该模型；否则图片块在构建请求时降级为占位符文本。
+  # 必须与所选模型能力一致（文本模型请写 [text]）。
+  input: [text, image]
+  # 会话 ID（每段对话稳定，用于网关路由/提示词缓存）。留空时启动
+  # 自动生成 UUID 并持久化到 os.db（system_vars），后续请求复用。
+  session_id: ""
+  # 思考链：不设 reasoning_effort 时模型对简单对话不吐 reasoning_content，
+  # 导致思维链没得保存、后续交互也没得回传。保持 high。
+  options:
+    reasoning_effort: medium
+    max_tokens: 32768
+  extra_params: {}
+
+# 两步上下文压缩（记住：enabled=false 关闭）
+compression:
+  enabled: true
+  max_tokens: 262144
+  # max_tokens: 153600
+  threshold: 0.8
+  # 触发线估算系数：最新 assistant usage 之后追加的尾部内容按
+  # 字符数 / 该系数 估算 token（provider usage 反映不了追加的工具结果）
+  estimate_chars_per_token: 3
+  # 尾部里每张图片按多少 token 估算。base64 数据不能按字符折算
+  # （单张 384KB 图 ≈ 52 万字符 → 17 万假 token，一贴图就误触发压缩）；
+  # 该值只作用于「尚未被 provider usage 覆盖」的尾部图片，保守取 4000。
+  image_tokens_estimate: 4000
+  # 压缩 LLM 输入（记忆提取/摘要）与 checkpoint recent 序列化的字符上限：
+  # 超限保留头尾、中间省略，保证压缩请求与压缩产物本身不超模型上限
+  max_input_chars: 200000
+  # 第二步：摘要 + 保留最近「刚好小于 keep_recent_tokens」的若干整轮
+  keep_recent_tokens: 16000
+  summary_prompt_file: config/prompt/compression_summary.md
+  # 压缩完成后的整理提醒模板（agent 收到的 user notice）：
+  # {memory_file} 为记忆文件容器路径占位符；记忆不可用时该行整行省略。
+  # 文件缺失时使用代码内置兜底文本。
+  reminder_file: config/prompt/compression_reminder.md
+  compressed_dir: ./data/compressed
+  # 第一步：记忆提取（不分平台分类，模型第一段输出原封不动追加写盘）
+  memory:
+    enabled: true
+    prompt_file: config/prompt/memory_extraction.md
+    file: data/workspace/memory/need_archive.md
+  # 独立压缩模型（可选；与主 agent 的 llm 分离）。
+  # 记忆提取与上下文摘要都走这个 LLM；enabled=false 时回退主 llm。
+  # 启用时把下面换成独立端点/密钥/模型（.env 的 LLM_COMPRESS_* 变量）。
+  llm:
+    enabled: false
+    protocol: openai-compatible
+    variant: generic
+    base_url: ${LLM_COMPRESS_BASE_URL}
+    api_key: ${LLM_COMPRESS_API_KEY}
+    model: ${LLM_COMPRESS_MODEL}
+    timeout_seconds: 600
+    retries: 2
+    retry_delay_seconds: 1.5
+    backoff_base: 2.0
+    retry_cap_seconds: 60.0
+    trailing_empty_user: true
+    # 压缩模型输入模态：含 image 时摘要/记忆提取会原生带图（模型需支持视觉），
+    # 否则上下文图片块以占位符文本参与压缩。独立压缩模型必填。
+    input: [text, image]
+  options:
+    reasoning_effort: high
+    max_tokens: 65536
+    extra_params: {}

@@ -1,0 +1,12 @@
+Write code in a linear, imperative "research scripting" style:
+
+- Top-to-bottom in execution order, one step per line: read -> clean -> transform -> model -> save
+- No classes/functions for encapsulation, no abstraction layers (extract only after 3+ real repetitions)
+- Avoid loops and defensive code (no default try/except, no re-validating known inputs)
+- Don't split simple statements across lines just to satisfy a style guide; one line if it fits
+- Use domain-meaningful variable names; keep intermediate results visible for inspection
+- Print key intermediate results (row counts, shapes, group counts)
+- Goal: I can scan it and see exactly what each line does and what to change
+
+Do not write it like an engineering project (no classes, no layering, no docstring padding).
+Switch back to engineering style only when the code will be run repeatedly, shared, or piped.

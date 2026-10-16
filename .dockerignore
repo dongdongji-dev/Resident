@@ -1,0 +1,17 @@
+# Docker 构建上下文排除（镜像内只保留运行所需；数据在运行时以 volume 挂载）
+.git
+.env
+data/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+frontend/node_modules/
+frontend/dist/
+src/kernel/console/frontend/dist/
+*.log
+.DS_Store

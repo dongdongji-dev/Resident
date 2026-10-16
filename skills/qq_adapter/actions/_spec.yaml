@@ -1,0 +1,355 @@
+# actions 清单（生成器的数据源）
+#
+# 每个动作一个目录、一个脚本只干一件事。这里的每条 = 一个动作脚本的形状；
+# `_generate.py` 读它生成 <dir>/<dir>.py（已存在的文件不覆盖，除非 --force）。
+# 属性名必须和服务端 ActionExecutor 认的名字一致（见 src/qq_adapter/actions.py）。
+#
+# pos  = 位置参数；opt = --xxx 可选；flag = --xxx 开关（给了就写 value，默认 "true"）
+# const = 恒定写进 payload 的属性；note = 追加到脚本说明里的话
+
+- dir: group_list
+  tag: get_group_list
+  brief: 列出我加入的所有群
+  note: 返回群号/群名/人数。
+
+- dir: group_member_list
+  tag: get_group_member_list
+  brief: 列出一个群的全部成员
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_member_info
+  tag: get_group_member_info
+  brief: 查某人在群里的信息（昵称/名片/身份/入群时间）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "被查的 QQ 号"}
+
+- dir: group_info
+  tag: get_group_info
+  brief: 查群基本信息
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_info_ex
+  tag: get_group_info_ex
+  brief: 查群扩展信息（群主/创建时间/人数上限等）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: stranger_info
+  tag: get_stranger_info
+  brief: 查陌生人资料（昵称/性别/等级/学校）
+  pos:
+    - {name: user_id, attr: user_id, help: "QQ 号"}
+
+- dir: user_status
+  tag: get_user_status
+  brief: 查某人在线状态
+  pos:
+    - {name: user_id, attr: user_id, help: "QQ 号"}
+
+- dir: friend_list
+  tag: get_friend_list
+  brief: 列出我的好友
+
+- dir: unidirectional_friend_list
+  tag: get_unidirectional_friend_list
+  brief: 列出单向好友（我加了对方、对方没加我）
+
+- dir: get_msg
+  tag: get_msg
+  brief: 按消息 id 取那条消息
+  pos:
+    - {name: message_id, attr: message_id, help: "消息 id"}
+
+- dir: group_msg_history
+  tag: get_group_msg_history
+  brief: 拉群聊历史消息
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+  opt:
+    - {name: count, attr: count, default: "20", help: "拉多少条（默认 20）"}
+
+- dir: group_notice
+  tag: get_group_notice
+  brief: 读群公告
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: essence_list
+  tag: get_essence_msg_list
+  brief: 列群精华消息
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_shut_list
+  tag: get_group_shut_list
+  brief: 列群禁言名单
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_system_msg
+  tag: get_group_system_msg
+  brief: 取群系统消息（入群申请等，含真 flag）
+  opt:
+    - {name: count, attr: count, default: "50", help: "取多少条（默认 50）"}
+  note: 入群/加好友的真 flag 从这里取（通知里的那串数字是截断值，不能用）。
+
+- dir: group_ignore_add_request
+  tag: get_group_ignore_add_request
+  brief: 列被忽略的入群申请
+
+- dir: doubt_friends_add_request
+  tag: get_doubt_friends_add_request
+  brief: 列未处理的好友申请
+  opt:
+    - {name: count, attr: count, default: "50", help: "取多少条（默认 50）"}
+
+- dir: file_url
+  tag: get_file_url
+  brief: 取群/私聊文件下载直链
+  pos:
+    - {name: conversation, attr: conversation_id, help: "会话键（决定走群还是私聊）"}
+    - {name: file_id, attr: file_id, help: "文件 id"}
+  note: 直链带时效（rkey），放久了取不到。
+
+- dir: group_root_files
+  tag: get_group_root_files
+  brief: 列群文件（根目录）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+  opt:
+    - {name: file_count, attr: file_count, default: "50", help: "取多少个（默认 50）"}
+
+- dir: group_file_system_info
+  tag: get_group_file_system_info
+  brief: 查群文件容量/数量概况
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: qun_album_list
+  tag: get_qun_album_list
+  brief: 列群相册
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_signed_list
+  tag: get_group_signed_list
+  brief: 列群打卡名单
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: emoji_likes
+  tag: get_emoji_likes
+  brief: 查某条消息的贴表情情况
+  pos:
+    - {name: message_id, attr: message_id, help: "消息 id"}
+    - {name: emoji_id, attr: emoji_id, help: "表情 id"}
+  opt:
+    - {name: count, attr: count, default: "0", help: "取多少个（默认 0=不限）"}
+
+- dir: profile_like
+  tag: get_profile_like
+  brief: 查自己主页获赞数
+
+- dir: group_at_all_remain
+  tag: get_group_at_all_remain
+  brief: 查群里 @全体成员还剩几次
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: send_forward
+  tag: send_forward
+  brief: 把某条消息转发到会话
+  pos:
+    - {name: conversation, attr: conversation_id, help: "目标会话键"}
+    - {name: message_id, attr: message_id, help: "被转发的消息 id"}
+
+- dir: send_like
+  tag: send_like
+  brief: 给某人资料卡点赞
+  pos:
+    - {name: user_id, attr: user_id, help: "QQ 号"}
+  opt:
+    - {name: times, attr: times, default: "1", help: "点几次（默认 1）"}
+
+- dir: set_msg_emoji_like
+  tag: set_msg_emoji_like
+  brief: 给某条消息贴表情
+  pos:
+    - {name: message_id, attr: message_id, help: "消息 id"}
+    - {name: emoji_id, attr: emoji_id, help: "表情 id"}
+  opt:
+    - {name: set, attr: set, default: "true", help: "true=贴上，false=取消"}
+
+- dir: group_sign
+  tag: group_sign
+  brief: 群打卡
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+
+- dir: group_todo
+  tag: group_todo
+  brief: 把某条消息设成群待办
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: message_id, attr: message_id, help: "消息 id"}
+
+- dir: kick
+  tag: kick
+  brief: 把成员移出群
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "被踢的 QQ 号"}
+  flag:
+    - {name: reject_add, attr: reject_add, value: "true", help: "同时拒绝此人再次申请"}
+  note: 需要管理员/群主。napcat 有时返回成功但实际没生效，以群里的实际情况为准。
+
+- dir: ban
+  tag: ban
+  brief: 群禁言（或解除）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "被禁言的 QQ 号"}
+  opt:
+    - {name: duration, attr: duration, default: "0", help: "禁言秒数，0=解除禁言"}
+  flag:
+    - {name: whole, attr: whole, value: "true", help: "切换全员禁言（忽略 user_id/duration）"}
+    - {name: enable, attr: enable, value: "true", help: "配合 --whole：开启全员禁言"}
+  note: 需要管理员/群主。
+
+- dir: set_card
+  tag: set_card
+  brief: 改群名片
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "谁的 QQ 号"}
+    - {name: card, attr: card, help: "新名片"}
+  note: 改自己名片也要走这里；改别人需要管理员。
+
+- dir: set_group_name
+  tag: set_group_name
+  brief: 改群名
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: name, attr: name, help: "新群名"}
+
+- dir: set_admin
+  tag: set_admin
+  brief: 设置/取消群管理员
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "谁的 QQ 号"}
+  opt:
+    - {name: enable, attr: enable, default: "true", help: "true=设为管理员，false=取消"}
+  note: 需要群主。
+
+- dir: set_special_title
+  tag: set_special_title
+  brief: 设专属头衔
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: user_id, attr: user_id, help: "谁的 QQ 号"}
+    - {name: title, attr: title, optional: "true", help: "头衔文本（用 --clear 时可省略）"}
+  flag:
+    - {name: clear, attr: title, value: " ", help: "清空头衔（服务端要求 title 非空，这里用空格顶掉）"}
+
+- dir: set_group_remark
+  tag: set_group_remark
+  brief: 给群设备注
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: remark, attr: remark, help: "备注"}
+
+- dir: set_friend_remark
+  tag: set_friend_remark
+  brief: 给好友设备注
+  pos:
+    - {name: user_id, attr: user_id, help: "QQ 号"}
+    - {name: remark, attr: remark, help: "备注"}
+
+- dir: set_essence
+  tag: set_essence
+  brief: 把某条消息设为群精华
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: message_id, attr: message_id, help: "消息 id"}
+
+- dir: delete_essence
+  tag: delete_essence
+  brief: 取消某条消息的群精华
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: message_id, attr: message_id, help: "消息 id"}
+
+- dir: send_group_notice
+  tag: send_group_notice
+  brief: 发群公告
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: content, attr: content, help: "公告正文"}
+  opt:
+    - {name: pinned, attr: pinned, default: "0", help: "1=置顶，0=不置顶"}
+    - {name: type, attr: type, default: "1", help: "公告类型（默认 1）"}
+  note: 需要管理员。
+
+- dir: delete_group_notice
+  tag: delete_group_notice
+  brief: 删群公告
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: notice_id, attr: notice_id, help: "公告 id"}
+
+- dir: handle_friend_request
+  tag: handle_friend_request
+  brief: 同意/拒绝好友申请
+  pos:
+    - {name: flag, attr: flag, help: "申请的真 flag（从 doubt_friends_add_request 取）"}
+  opt:
+    - {name: approve, attr: approve, default: "true", help: "true=同意，false=拒绝"}
+    - {name: remark, attr: remark, default: "", help: "加好友后的备注（可空）"}
+  note: ⚠️ 通知里带的那串数字是截断值，用了会 ok:true 但没生效——flag 必须先查。
+
+- dir: handle_group_request
+  tag: handle_group_request
+  brief: 同意/拒绝入群申请
+  pos:
+    - {name: flag, attr: flag, help: "申请的真 flag（从 group_system_msg 或消息 raw_segments 取）"}
+  opt:
+    - {name: approve, attr: approve, default: "true", help: "true=同意，false=拒绝"}
+    - {name: reason, attr: reason, default: "", help: "拒绝理由（可空）"}
+    - {name: sub_type, attr: sub_type, default: "add", help: "add / invite（默认 add）"}
+  note: ⚠️ 通知里的数字是截断值，会 ok:true 但没生效；先查真 flag。
+
+- dir: delete_friend
+  tag: delete_friend
+  brief: 删好友（不可逆）
+  pos:
+    - {name: user_id, attr: user_id, help: "QQ 号"}
+  note: 高风险动作，服务端默认禁用；要用先在 config/local.yaml 顶层 actions 段打开并重启。
+
+- dir: set_group_leave
+  tag: set_group_leave
+  brief: 退群（或解散群）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+  flag:
+    - {name: dismiss, attr: dismiss, value: "true", help: "解散该群（需群主，不可逆）"}
+  note: 高风险动作，服务端默认禁用；退群前先跟约定确认。
+
+- dir: delete_group_file
+  tag: delete_group_file
+  brief: 删群文件（不可逆）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: file_id, attr: file_id, help: "文件 id（从 group_root_files 取）"}
+  note: 高风险动作，服务端默认禁用；要用先在 config/local.yaml 顶层 actions 段打开并重启。
+
+- dir: delete_group_folder
+  tag: delete_group_folder
+  brief: 删群文件目录（不可逆）
+  pos:
+    - {name: conversation, attr: conversation_id, help: "群会话键 group_xxx"}
+    - {name: folder_id, attr: folder_id, help: "目录 id（从 group_root_files 取）"}
+  note: 高风险动作，服务端默认禁用；要用先在 config/local.yaml 顶层 actions 段打开并重启。

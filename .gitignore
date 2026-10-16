@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# virtualenv
+.venv/
+venv/
+
+# runtime data
+data/
+
+# logs
+*.log
+
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# frontend (node + build artifacts)
+frontend/node_modules/
+frontend/dist/
+src/kernel/console/frontend/dist/
+
+# 本地环境变量（含密钥，绝不上传）
+.env
+
+# 配置：config/agent.yaml 与 config/prompt/user/persona.md 均为脱敏后的
+# 分发配置，允许入库；个人私密值只放 .env（已被忽略）
+
+# 会话导出/研究日志（agent 产物）
+session-*.md

@@ -1,0 +1,96 @@
+# Resident — Docker 部署（console + kernel + 沙箱容器）
+#
+# 用法：
+#   cp .env.example .env          # 必做：compose 需要 .env（首次启动自动生成 token）
+#   docker compose up -d --build
+#   docker compose logs -f resident   # 启动日志里有首次登录密钥
+#
+# 镜像来源：安装脚本先 docker compose pull（远程镜像），拉不到再本地构建。
+# 发布官方镜像后在 .env 设置 RESIDENT_APP_IMAGE / RESIDENT_SANDBOX_IMAGE 即可走拉取路径。
+#
+# 中国大陆网络：install 脚本探测到大陆时会自动在 .env 写入
+# RESIDENT_APT_MIRROR / RESIDENT_NPM_REGISTRY / RESIDENT_PIP_INDEX_URL，
+# 构建与依赖安装自动走国内源；拉取基底镜像失败时可将基底换成镜像源
+# （如 docker.m.daocloud.io/library/python:3.12-slim）。
+
+services:
+  resident:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+      args:
+        # 基底镜像与依赖源（中国大陆可在 .env 里启用镜像加速，
+        # install 脚本加 --cn / -Cn 会自动写入）
+        NODE_IMAGE: ${RESIDENT_NODE_IMAGE:-node:20-slim}
+        DOCKERCLI_IMAGE: ${RESIDENT_DOCKERCLI_IMAGE:-docker:27-cli}
+        PYTHON_IMAGE: ${RESIDENT_PYTHON_IMAGE:-python:3.12-slim}
+        NPM_REGISTRY: ${RESIDENT_NPM_REGISTRY:-}
+        PIP_INDEX_URL: ${RESIDENT_PIP_INDEX_URL:-}
+        APT_MIRROR: ${RESIDENT_APT_MIRROR:-}
+    image: ${RESIDENT_APP_IMAGE:-resident-app:latest}
+    container_name: resident
+    restart: unless-stopped
+    # 不用 env_file（避免容器创建时把旧 .env 值固化进容器环境）：
+    # .env bind 挂载为 /app/.env，进程启动时读取；console 拉起 kernel 前
+    # 会重读覆盖，因此「编辑 .env → 前端重启 Kernel」即生效。
+    # 端口/构建参数的 ${} 插值仍由 compose 自动读项目 .env，不受影响。
+    environment:
+      # 全系统用本地时间；部署在非东八区请覆盖
+      TZ: ${TZ:-Asia/Shanghai}
+      # 清空代理变量：Docker Desktop 会把代理设置注入容器，localhost 代理
+      # 在容器里是死代理会破坏容器网络；需要时自行加回（如 http_proxy:
+      # "http://host.docker.internal:7890"）
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      all_proxy: ""
+      ALL_PROXY: ""
+      no_proxy: ""
+      NO_PROXY: ""
+    extra_hosts:
+      # 容器内可用 host.docker.internal 访问宿主（NapCat 容器等）
+      - "host.docker.internal:host-gateway"
+    ports:
+      # 对外暴露由 .env 的 RESIDENT_CONSOLE_BIND 控制：
+      # 0.0.0.0 = 局域网可访问；127.0.0.1 = 仅本机（安装脚本会询问并写入）
+      - "${RESIDENT_CONSOLE_BIND:-127.0.0.1}:18082:18082"
+      # 沙箱对外服务端口（沙箱与 resident 共享网络命名空间，见下）
+      - "19090:19090"
+    volumes:
+      - ./data:/app/data          # 运行数据（os.db / context.jsonl / workspace…）
+      - ./config:/app/config      # 配置文件（控制台「配置」视图读写这里）
+      - ./.env:/app/.env          # 运行时配置读取 + 首启自动生成 token 写回宿主
+      # kernel 通过 docker exec 驱动沙箱容器（功能必需；等价于授予本容器
+      # 宿主 Docker 的控制权——注意这台机器上所有容器的安全边界）
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  resident-sandbox:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${RESIDENT_PYTHON_IMAGE:-python:3.12-slim}
+        APT_MIRROR: ${RESIDENT_APT_MIRROR:-}
+    image: ${RESIDENT_SANDBOX_IMAGE:-resident-sandbox:latest}
+    container_name: resident-sandbox   # kernel 按此名字 docker exec，勿改
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 清空代理变量（同 resident：防 localhost 代理注入破坏容器网络）
+      http_proxy: ""
+      https_proxy: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      all_proxy: ""
+      ALL_PROXY: ""
+      no_proxy: ""
+      NO_PROXY: ""
+    # 与 resident 共享网络命名空间：沙箱里的 skill（如 QQ 适配器）可直连
+    # 127.0.0.1:18086 访问 kernel；宿主端口由 resident 的 ports 统一映射
+    network_mode: "service:resident"
+    volumes:
+      - ./data/workspace:/home/sandbox  # agent 工作区（与 resident 共享同一宿主目录）
+    depends_on:
+      - resident

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""_receipt.py — actions/ 共用：发送回执对账（对着 core 消息库逐字核对）。
+
+为什么要有：只看到 ok:true/message_id 不够——必须能确认「真正发出去的是什么」。
+2026-09-28 23:3x 设计约定后加；2026-10-12 从 scripts/send_msg.py 搬进 actions，
+让「走 action 发消息」也自带回执（否则我会下意识绕回老脚本，约定 23:22 点过）。
+
+判据（三情形）：
+  ① 正常：有 message_id + 逐字对账通过
+  ② 「无 out 消息」：落库延迟，等一会儿重取
+  ③ 真·静默失败：ok:true 但 message_id 为 None、库里没有 out 记录 ⇒ 没发出去，原文重发
+
+对账前会抹掉适配器的两类改写（HTML 转义、`<reply/>`/`<at/>` 前缀段），
+并跳过系统类 out 记录（`[消息撤回]` / `[notice` / `[系统`）。
+状态（各会话已对账到的 seq）落 <state_dir>/lastseq.json。
+"""
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+SANDBOX = Path("/home/sandbox")
+CORE_BASE = os.environ.get("CORE_API_URL", "http://host.docker.internal:18086")
+PLATFORM = os.environ.get("QQ_ADAPTER_PLATFORM", "qq[1000000001]")
+
+# 适配器**真的会加**的前缀（只剥这些；见 norm() 的踩坑说明）
+_ADAPTER_PREFIX_RE = re.compile(
+    r"^(?:\[(?:reply|at\b[^\]]*|notice\b[^\]]*|系统[^\]]*|消息撤回)\]"
+    r"|<(?:reply|at)\b[^>]*>)\s*")
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("QQ_ADAPTER_STATE_DIR",
+                               SANDBOX / "skill_data" / "qq_adapter"))
+
+
+def _lastseq_path() -> Path:
+    return Path(os.environ.get("QQ_ADAPTER_LASTSEQ",
+                               _state_dir() / "lastseq.json"))
+
+
+def _core_key() -> str | None:
+    p = SANDBOX / ".secrets" / "core_api_key.txt"
+    if not p.is_file():
+        return None
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            val = line.rsplit("=", 1)[1].strip()
+            if val:
+                return val
+        else:
+            return line
+    return None
+
+
+def _api_messages(conv: str, after_seq: int, limit: int = 300) -> list:
+    """经 core API 读消息库。conv 形如 private_1000000002 / group_200000001。"""
+    key = _core_key()
+    if not key:
+        return []
+    url = (f"{CORE_BASE}/api/messages?platform={urllib.parse.quote(PLATFORM)}"
+           f"&conversation_id={urllib.parse.quote(conv)}"
+           f"&after_seq={after_seq}&limit={limit}")
+    req = urllib.request.Request(url, headers={"X-Api-Token": key})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 内网绕代理
+    with opener.open(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get("messages", []) if isinstance(data, dict) else data
+
+
+def _load_seq(conv: str) -> int:
+    try:
+        state = json.loads(_lastseq_path().read_text(encoding="utf-8"))
+    except Exception:                                     # noqa: BLE001
+        state = {}
+    return int(state.get(conv, 0))
+
+
+def _save_seq(conv: str, seq: int) -> None:
+    try:
+        state = json.loads(_lastseq_path().read_text(encoding="utf-8"))
+    except Exception:                                     # noqa: BLE001
+        state = {}
+    state[conv] = seq
+    path = _lastseq_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _bootstrap_seq(conv: str) -> int:
+    """首次：二分找该会话当前最大 seq。"""
+    lo, hi = 0, 10_000_000
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        try:
+            if _api_messages(conv, mid, 1):
+                lo = mid
+            else:
+                hi = mid - 1
+        except Exception:                                 # noqa: BLE001
+            return 0
+    return lo
+
+
+def norm(s: str) -> str:
+    """抹掉适配器落库时加的前缀段（HTML 转义 + reply/at 前缀）。
+
+    ⚠️ 只剥**适配器真正会加的**前缀（`[reply]` / `[at xxx]` / `<reply .../>`
+    / `<at .../>` 与几个系统前缀），不能见 `[` 就剥——2026-10-13 00:16 实测
+    踩坑：我发的正文以 `[自测]` 开头，被当成前缀剥掉 → 回执误报「不一致」。
+    """
+    s = html.unescape((s or "").strip())
+    while True:
+        m = _ADAPTER_PREFIX_RE.match(s)
+        if not m:
+            break
+        s = s[m.end():].lstrip()
+    return s
+
+
+def _is_system_out(text: str) -> bool:
+    t = (text or "").lstrip()
+    return (t.startswith("[消息撤回]") or t.startswith("[notice")
+            or t.startswith("[系统"))
+
+
+def verify(conv: str, text: str, response: dict | str | None,
+           tries: int = 3) -> str:
+    """对账并返回一行结论（不抛异常；core 不可达时如实说明）。"""
+    mid = None
+    try:
+        if isinstance(response, str):
+            response = json.loads(response)
+        mid = (response or {}).get("result", [{}])[0].get("message_id")
+    except Exception:                                     # noqa: BLE001
+        mid = None
+    head = text.strip()[:80].replace("\n", " / ")
+    line = f"✅ 已发送 {len(text)} 字 · message_id={mid}\n   正文开头：{head}"
+    if mid is None:
+        line = (f"⚠️ 发送回执可疑：message_id 为空（可能没真发出去）\n"
+                f"   正文开头：{head}")
+    try:
+        before = _load_seq(conv) or _bootstrap_seq(conv)
+        want = text.strip()
+        outs: list = []
+        for attempt in range(tries):
+            msgs = _api_messages(conv, before)
+            if msgs:
+                _save_seq(conv, max(int(m.get("seq", 0)) for m in msgs))
+            outs = [m for m in msgs if m.get("direction") == "out"
+                    and not _is_system_out(m.get("content") or "")]
+            for m in reversed(outs):
+                got = norm(m.get("content") or "")
+                if got == want or (want[:30] and got.startswith(want[:30])):
+                    return line + (f"\n   ✅ 回执对账通过：消息库 seq "
+                                   f"{m.get('seq')} / 落库 {len(got)} 字，与发送正文一致")
+            if attempt < tries - 1:
+                time.sleep(1.5)
+        last = ((outs[-1].get("content") or "")[:80].replace("\n", " / ")
+                if outs else "(无 out 消息)")
+        return line + f"\n   ⚠️ 回执不一致：消息库最新 out 内容是「{last}」"
+    except Exception as exc:                              # noqa: BLE001
+        return line + f"\n   ⚠️ 回执未对账（core API 不可达：{exc}）"

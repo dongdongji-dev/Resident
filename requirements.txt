@@ -1,0 +1,8 @@
+# Resident runtime dependencies (mirror of pyproject.toml [project] dependencies)
+# Install: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+# The last line installs this repo itself (editable; src layout)
+PyYAML>=6.0
+aiohttp>=3.8
+certifi
+Pillow>=10.0
+-e .

@@ -1,0 +1,71 @@
+# qq_adapter —— 通用默认配置
+#
+# 规矩：这个文件里**不许出现任何身份信息**（谁的号、谁的白名单、token、密钥）。
+#   · 本机差异 → config/local.yaml（后加载、覆盖本文件）
+#   · 密钥     → 环境变量，由 start.sh 从 .secrets/ 注入
+# 任何 agent 拿到这份 skill，配好自己的 local.yaml + 密钥就能用自己号登录。
+#
+# 路径一律相对 skill 目录（start.sh 会 cd 过来）。
+
+# 运行时状态目录（pid / port / attention.json / raw_events.jsonl / 日志）
+# 数据规矩：skill 自身目录不放数据 ⇒ 默认落到工作区 skill_data/<skill_name>/
+state_dir: /home/sandbox/skill_data/qq_adapter
+
+napcat:
+  # OneBot11 正向 WebSocket（napcat / Lagrange 等都行）
+  ws_url: ws://127.0.0.1:3001
+  access_token: ${NAPCAT_TOKEN}      # 密钥从环境变量来，不写死
+  platform: qq[10001]                # 占位；连上后自动更新为真实 bot QQ
+  api_timeout_seconds: 15
+  heartbeat_seconds: 30
+  wakeup_on_mention: true
+  reconnect_backoff: [1, 2, 4, 8, 16, 30, 60]
+  # 媒体根目录（发送媒体时读文件用）；留相对路径 = 相对 skill 目录
+  media_files_root: data/files
+  # 小文件走 base64 直发；超过此值走 adapter 文件服务 URL
+  media_base64_max_bytes: 5242880
+  # 大文件 URL 前缀（napcat 按 URL 拉取）；留空 = 大文件也 base64（不推荐）
+  media_serve_url: ""
+  # 入站媒体下载超时（按段类型，秒）；旧实现写死 12s，大文件必超时
+  media_download:
+    # 自动下载大小上限（MB）：超过就不下载——消息里改给实际 url 直链，
+    # 并由适配器发一条 notice 提醒（直链是 QQ 侧临时地址、有时效）。
+    # 0 = 不限制。
+    max_mb: 50
+    timeouts:
+      image: 30
+      record: 120
+      video: 180
+      file: 600
+  # 会话白名单（双层：入站不入库 + 出站拒绝执行）
+  # 默认全放开；限制自己的号/群请写进 config/local.yaml
+  whitelist:
+    private_enabled: false
+    private: []
+    group_enabled: false
+    group: []
+
+core:
+  # kernel / agent core 的 HTTP 地址（入站消息 POST /api/messages 用）
+  url: http://127.0.0.1:18086
+  api_key: ${CORE_API_KEY}           # 同时用作 /hook 的鉴权 token
+
+# 原始事件落盘（排障：抓"空内容"事件的真实 payload）
+# path 留空 = <state_dir>/raw_events.jsonl
+raw_events:
+  enabled: true
+  mode: anomalous        # all | anomalous
+
+# agent / actions 调用的本地 HTTP 端点
+callback:
+  host: 127.0.0.1
+  port: 19671
+
+# core → adapter 文件传输上限
+transfer:
+  max_bytes: 2147483648
+
+# 动作级开关（**顶层键**！写进 napcat: 段里会静默失效）
+# 未列出的走默认：高风险 false，其余 true
+# 例：临时开高风险动作 → 重启服务 → 用完删掉再重启
+actions: {}

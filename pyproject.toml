@@ -1,0 +1,21 @@
+[project]
+name = "resident"
+version = "0.1.0"
+description = "Agent OS Kernel — platform-neutral agent framework (tool registration + ReAct loop + multi-protocol LLM adapters)"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "dongdongji-dev" }]
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+  "aiohttp>=3.8",
+  "certifi",
+  "Pillow>=10.0",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

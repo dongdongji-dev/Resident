@@ -1,0 +1,46 @@
+# Resident console —— 控制平面（supervisor + 前端入口）
+# 端口全部来自配置，不用随机端口；console 是独立进程，负责拉起/保活 kernel。
+console:
+  # 监听地址：默认仅本机；要对局域网/公网开放改为 0.0.0.0
+  # （务必配合防火墙/安全组；所有 /api/* 仍需 token 鉴权）
+  host: 127.0.0.1
+  port: 18082
+  # console 自己的鉴权密钥（前端所有 /api/* 必须携带）
+  # 首次启动会自动生成强随机值并写入 .env（同时打印在启动日志里）
+  api_token: ${RESIDENT_CONSOLE_TOKEN}
+  # 转发到 kernel http_interface 时注入的 kernel 鉴权密钥
+  kernel_api_key: ${RESIDENT_API_KEY}
+  # kernel 的 stdout/stderr 落盘（持久化日志，支持增量 tail 与轮转）
+  log_file: ./data/logs/kernel.log
+  log_archive_file: ./data/logs/kernel.log.archive
+  log_max_mb: 10
+  log_poll_interval_seconds: 1
+  # kernel（被管理的核心进程）
+  core:
+    # kernel 解释器：由 .env 的 RESIDENT_PYTHON 提供（Windows host 为
+    # .venv\Scripts\python.exe；其余平台/Docker 为 .venv/bin/python）
+    executable: ${RESIDENT_PYTHON}
+    module: kernel.agent_framework
+    args: ["--config", "config/agent.yaml"]
+    auto_start: true
+    stop_timeout_seconds: 5
+  # kernel 自带的 http_interface 地址（console 做单端口路径代理到它）
+  kernel_url: http://127.0.0.1:18086
+  # 「配置」视图：可读写的配置目录（相对路径按仓库根解析；
+  # 仅允许白名单扩展名 .yaml/.yml/.md/.txt/.json）
+  config_dir: ./config
+  # 保存前旧文件备份目录（放 data/ 下）/ 单文件大小上限
+  config_backup_dir: ./data/config_backups
+  config_edit_max_bytes: 262144
+
+# sandbox：沙箱容器由外部负责就绪——源码方式下 scripts/start.sh 会自动
+# 构建镜像/创建容器；Docker 方式下由 compose 管理。此处保持 false，
+# console 自身不做任何 docker 操作。
+sandbox:
+  enabled: false
+  image: resident-sandbox
+  container: resident-sandbox
+  workspace_host: ./data/workspace
+  workspace_container: /home/sandbox
+  port: 19090
+  start_timeout_seconds: 180

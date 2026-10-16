@@ -1,0 +1,102 @@
+# subagent 输入定义（按 docs/SKILL_V2_SPEC.md §2）
+#
+# 三类输入：
+#   http     —— 我从外面调 hub 的同步请求（要回响应，不唤醒我）
+#   event    —— hub 内部产生的异步事件（可唤醒我，默认走 notice 表）
+#   schedule —— 定时自检（暂未启用）
+#
+# 唤醒通道口径：notice = 系统事件/工具结果（我的默认）；messages = 真的像"某人发来的话"；
+#              none = 只落日志、不唤醒。自建服务的事件一律 notice，不用 messages 污染会话。
+#
+# ★ 代码读取：hub.AgentManager 启动时加载本文件（config/inputs.yaml），
+#   在 _default_notice_hook 里按 **event 的 kind** 找声明（id 即 kind）：
+#     未声明 / wakeup: false / channel: none  → 只落日志，不推 core notice；
+#     声明了且 wakeup: true                   → 按 prompt 模板渲染后 POST core /api/notice；
+#     dedup_s                                  → 同 id 多久内不重复推。
+#   ⚠️ id 必须与代码里实际发出的 event kind 一致，否则等于没声明（保守默认：不唤醒）。
+#   当前代码发出的 kind：completed / tool_error / compressed / exec_approval
+#   （exec 命令审批与 ask 提问**共用** exec_approval 这个 kind，靠 payload 里的
+#    command 字段区分）。
+
+inputs:
+
+  # ── http：我驱动 hub（全部不唤醒；我只在主动操作时用，走 actions/）──────
+  - id: agent_spawn
+    kind: http
+    desc: 注册（spawn）一个新 subagent 实例
+    endpoint: "POST /api/agents"
+    wakeup: false
+  - id: agent_prompt
+    kind: http
+    desc: 给实例派一条任务
+    endpoint: "POST /api/agents/<name>/prompt"
+    wakeup: false
+  - id: agent_approve
+    kind: http
+    desc: 审批越界 exec / 文件操作
+    endpoint: "POST /api/agents/<name>/approve"
+    wakeup: false
+  - id: agent_ask_reply
+    kind: http
+    desc: 答复实例的提问
+    endpoint: "POST /api/agents/<name>/ask_reply"
+    wakeup: false
+  - id: agent_admin
+    kind: http
+    desc: 关闭 / 回滚 / 换模型 / 压缩 / 读上下文 / 查状态
+    endpoint: "POST|GET /api/agents/<name>/{close,restore,switch_model,compress,context}, GET /api/{status,profiles,agents}"
+    wakeup: false
+
+  # ── event：hub 推给我（唤醒通道 = notice）───────────────────────────
+  - id: completed
+    kind: event
+    desc: 实例跑完一轮、且没有后续工具调用（带最终回复）——本轮结束的报告
+    wakeup: true
+    channel: notice
+    prompt: |
+      [subagent] {agent} 完成了任务：
+      {summary}
+    dedup_s: 5
+
+  - id: exec_approval
+    kind: event
+    desc: 实例请求越界命令审批 / 用 ask 工具提问，阻塞等我批（payload 的 command 字段区分）
+    wakeup: true
+    channel: notice
+    prompt: |
+      [subagent] {agent} 需要我处理（{kind}）：
+      {message}
+      请求ID：{request_id}
+    dedup_s: 0
+
+  - id: tool_error
+    kind: event
+    desc: 实例的一轮里工具执行失败（不阻塞，失败已写回它自己的上下文）
+    wakeup: true
+    channel: notice
+    prompt: |
+      [subagent] {agent} 工具出错：{error}
+    dedup_s: 30
+
+  - id: round_failed
+    kind: event
+    desc: 实例连续多轮 LLM 调用失败（后端不可用/额度问题），已转入退避
+    wakeup: true
+    channel: notice
+    prompt: |
+      [subagent] {agent} 连续失败，已退避：
+      {message}
+    dedup_s: 600
+
+  - id: compressed
+    kind: event
+    desc: 实例上下文被压缩（纯状态，不值得吵我）
+    wakeup: false
+    channel: none
+
+  # ── schedule：定时自检（暂未启用，留位）───────────────────────────
+  - id: hub_health
+    kind: schedule
+    desc: 每小时探一次 hub /api/status，挂了才提醒
+    wakeup: false
+    cron: "0 * * * *"

@@ -1,0 +1,138 @@
+# subagent —— 通用默认配置（v2 规范 / docs/SKILL_V2_SPEC.md）
+#
+# 规矩：本文件**不出现任何身份信息、密钥、本机专属地址**。
+#   · 本机差异（端口、core 地址、模型名、白名单）→ config/local.yaml（后加载，深合并覆盖本文件）
+#   · 密钥 → 环境变量，由 start.sh 从 .secrets/ 注入（${LLM_API_KEY} 这类占位）
+# 任何 agent 拿到这份 skill，配好自己的 local.yaml + 密钥就能跑自己的 subagent。
+#
+# 路径相对说明：state_dir / context_root 这类值若以 ./ 开头，代码按 skill 根目录解析。
+
+# ── 运行时 ─────────────────────────────────────────────────────────
+runtime:
+  # 实例 context 根目录（每个 session 一个子目录 + session.json 元数据）
+  # 数据规矩：skill 目录里不放运行时数据 ⇒ 默认落工作区 skill_data/<skill_name>/
+  context_root: /home/sandbox/skill_data/subagent
+  log_level: INFO
+
+# ── 完成/审批通知回推（hub._default_notice_hook → POST core /api/notice）──
+# ★ 只有 config/inputs.yaml 里声明 wakeup: true 的事件才会走这里（见 inputs.yaml）
+notice:
+  url: http://127.0.0.1:18086/api/notice      # core 通知端点（本机地址在 local.yaml 覆盖）
+  timeout_s: 6                                 # 单次请求阻塞上限（秒）
+
+# ── agent：框架行为参数（hub 的 AgentManager 读取）──────────────────
+agent:
+  tool_timeout_seconds: 300              # 工具执行总超时
+  event_batch_wait_seconds: 0.5          # idle 见事件后批等待
+  repair_latest_n: 5                     # 每轮前修复 context 尾 N 条
+  user_merge:                            # user 消息合并
+    enabled: true
+    separator: "\n\n---\n\n"
+    notice: "[系统提示] 以下为本次批内合并的多条消息，请注意逐条回应。"
+  # LLM 调用失败退避（防"后端持续 400 → agent 死循环烧额度"）
+  failure_backoff:
+    backoff_base_s: 0.5      # 首次退避；之后翻倍 1/2/4/…
+    backoff_max_s: 60        # 单次退避上限
+    alert_after: 3           # 连续失败达此次数 → 发一次 round_failed notice
+    cooldown_after: 5        # 连续失败达此次数 → 转长效冷却
+    cooldown_s: 300          # 长效冷却时长（事件不丢，已重新入队）
+
+# ── 项目身份（build_system_prompt 身份头引用）─────────────────────
+project:
+  name: subagent
+  user_dir: .
+
+# ── prompt 提示词拼接（build_system_prompt 加载 identity）──────────
+prompt:
+  directory: config/prompt
+  files:
+  - system/identity.md
+
+# ── LLM 模型配置（spawn/switch_model 按 profile 名指定）─────────────
+# 每个 profile 是一份完整 llm 配置；模型名在本文件留环境变量占位，
+# 具体用哪个模型写进 config/local.yaml。
+llm_profiles:
+  default:
+    protocol: openai-compatible
+    variant: deepseek
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    model: ${SUBAGENT_LLM_MODEL}
+    timeout_seconds: 600
+    retries: 2
+    retry_delay_seconds: 1.5
+    backoff_base: 2.0
+    retry_cap_seconds: 60.0
+    options:
+      reasoning_effort: medium
+      max_tokens: 32768
+    extra_params: {}
+  匿名模型:
+    protocol: openai-compatible
+    variant: deepseek
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    model: ${SUBAGENT_LLM_MODEL_OMEN}
+    timeout_seconds: 600
+    retries: 2
+    retry_delay_seconds: 1.5
+    backoff_base: 2.0
+    retry_cap_seconds: 60.0
+    options:
+      max_tokens: 32768
+      reasoning_effort: medium
+    extra_params: {}
+
+# ── 上下文压缩（push_event 后 / 手动端点触发；只做 step2，无 memory 提取）─
+# enabled=false → hub 不建压缩 LLM、不自动压缩、手动端点返回未启用。
+compression:
+  enabled: true
+  max_tokens: 262144                     # 窗口上限（上下文 token 总量）
+  threshold: 0.8                         # 自动触发阈值比例
+  keep_recent_tokens: 16000
+  summary_prompt_file: config/prompt/compression_summary.md
+  llm_profile: 匿名模型                      # 独立压缩模型（llm_profiles 里的名字）
+  manual_timeout_s: 180                  # 手动压缩（POST /compress）阻塞等待上限（秒）
+
+# ── hub：常驻入口（HTTP 监听，管理 agent 实例）──────────────────────
+#   POST /api/agents                      注册实例 {name, system_prompt|profile}
+#   GET  /api/agents                      列实例
+#   GET  /api/status                      健康/实例清单
+#   GET  /api/profiles                    可用模型 profile
+#   GET  /api/agents/<name>/context       读实例 context.jsonl
+#   POST /api/agents/<name>/prompt        发 prompt {content}
+#   POST /api/agents/<name>/approve       审批越界 exec/文件操作
+#   POST /api/agents/<name>/ask_reply     答复实例提问
+#   POST /api/agents/<name>/compress      手动压缩上下文
+#   POST /api/agents/<name>/restore       回滚 checkpoint
+#   POST /api/agents/<name>/switch_model  换模型
+#   POST /api/agents/<name>/close         关闭实例
+hub:
+  host: 127.0.0.1
+  port: 19711
+  # 服务鉴权：非空时所有 /api/* 要求 X-Api-Token 头（密钥从 .secrets 注入）。
+  # 留空 = 不鉴权（默认，只监听本机）。
+  api_key: ${SUBAGENT_HUB_TOKEN}
+
+# ── exec 命令执行工具（workspace_tools.exec）───────────────────────
+# whitelist：命令白名单（只填命令名，不含参数）；不在名单 → 触发审批（notice 通知，
+# 阻塞等 /api/agents/<name>/approve；超时按拒绝）。
+exec:
+  whitelist: [ls, pwd, cat, python3, python, grep, find, head, tail, wc, mkdir, touch, echo, sed, awk, sort, uniq, cut, tr, diff, file, stat, du, which, date, cp, mv, fc-list, fc-match]
+  approval_timeout_s: 300
+
+# ── workspace 文件工具（read/write/edit/glob/grep/delete/exec）──────
+# 含 path 的工具执行前先 check_path 校验是否在工作区内；越界 → 审批（同 exec）。
+workspace_tools:
+  trash_dir: ./skill_data/subagent/trash   # 安全删除回收站（不真删）
+  read_max_bytes: 65535
+  read_max_lines: 1000
+  read_warn_bytes: 32768
+  read_default_line_numbers: true
+  glob_max_results: 100
+  grep_head_limit: 250
+  grep_max_columns: 500
+  edit_max_old_chars: 20000
+  edit_output_max_chars: 20000
+  write_max_bytes: 262144
+  exec_default_timeout_s: 60

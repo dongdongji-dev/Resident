@@ -1,0 +1,248 @@
+# Subagent Agent Framework — 所有参数都在此配置，代码里无隐藏默认值。
+# 仅保留 subagent 框架实际引用的段；其余 resident 遗留段一律注释（保留参考备查）。
+
+# ── 运行时 ─────────────────────────────────────────────────────────
+# 只读 context_root（context 根目录）、log_level
+runtime:
+  # name: resident                      # 未引用
+  # data_dir: ./data                    # 未引用
+  context_root: /home/sandbox/skill_data/subagent   # 引用：hub 注册实例时 session 根目录（每个 session 一个子目录 + session.json 元数据）
+  # compressed_dir: ./data/compressed   # 未引用
+  log_level: INFO                       # 引用：hub 日志级别
+  # log_format: text                    # 未引用
+
+# ── 数据库（未引用，subagent 无 os.db）──────────────────────────────
+# database:
+#   path: ./data/os.db
+
+# ── 待办树（未引用，subagent 无 todos）──────────────────────────────
+# todos:
+#   file: ./data/todos.json
+
+# ── 消息查询工具（未引用，subagent 无消息工具）──────────────────────
+# messages_tools:
+#   query_max_rows: 200
+#   list_latest: 5
+#   content_max_chars: 300
+#   unread_latest: 20
+#   list_threads_limit: 200
+#   range_max_chars: 10000
+#   range_limit: 200
+#   detail_max_chars: 10000
+#   clear_show: 10
+#   download_dir: ./data/workspace/download
+
+# ── 完成/审批通知回推（引用：hub._default_notice_hook → POST core /api/notice）─
+# url=core 的 notice 端点（清代理直连 host.docker.internal）；timeout_s=单次请求
+#   阻塞上限（秒，原代码硬编码 6 → 09-16 按"变量进配置"原则下沉）。
+notice:
+  url: http://host.docker.internal:18086/api/notice
+  timeout_s: 6
+
+# ── agent：框架行为参数（hub 的 AgentManager 读取）──────────────────
+agent:
+  tool_timeout_seconds: 300              # 引用：工具执行总超时（hub → Agent）
+  event_batch_wait_seconds: 0.5         # 引用：idle 见事件后批等待
+  repair_latest_n: 5                    # 引用：每轮前修复 context 尾 N 条
+  user_merge:                           # 引用：user 消息合并
+    enabled: true
+    separator: "\n\n---\n\n"
+    notice: "[系统提示] 以下为本次批内合并的多条消息，请注意逐条回应。"
+  # model_output_threshold_chars: 800             # 未引用（resident 自说自话检测）
+  # model_output_line_max_chars: 100              # 未引用
+  # unread_window_hours: 1                        # 未引用（resident 未读统计）
+  # unread_max_per_session: 99                    # 未引用
+  # llm_failed_backoff_seconds: 2.0               # 未引用
+
+# ── wake 主动唤醒（未引用，subagent 无 wake 逻辑）───────────────────
+# wake:
+#   initial_probability: 0.03
+#   min_probability: 0.01
+#   unread_weight: 0.05
+#   wake_x_convs: 10
+#   wake_max_chars: 2000
+#   inject_latest: true
+#   mark_latest_read: false
+#   wake_dedup: true
+#   wake_cooldown_seconds: 60
+#   wake_notice_prefix: 这是系统目前已连接的消息适配器推送的消息...
+#   no_message_prompt_file: config/schedule/awake_no_message.md
+
+# ── beat 调度（未引用，subagent 无 beat）────────────────────────────
+# beat:
+#   enabled: true
+#   interval_seconds: 5
+#   archive_interval_hours: 24
+#   archive_days: 30
+
+# ── events_port（未引用）────────────────────────────────────────────
+# events_port:
+#   enabled: true
+#   host: 127.0.0.1
+#   port: 18087
+#   api_key: ${RESIDENT_API_KEY}
+
+# ── 项目身份（build_system_prompt 身份头引用；model 读自 llm 段真实模型）─
+project:
+  name: subagent
+  user_dir: /home/sandbox
+
+# ── prompt 提示词拼接（引用：build_system_prompt 加载 identity）─────
+prompt:
+  directory: config/prompt
+  files:
+  - system/identity.md
+
+# ── workspace 宿主映射（未引用，subagent 无挂载层）──────────────────
+# workspace:
+#   host_root: ./data/workspace
+#   container_path: /home/sandbox
+
+# ── skills（未引用，subagent 无 SKILL.md 扫描）──────────────────────
+# skills:
+#   enabled: true
+#   directory: ./data/workspace/.skills
+
+# ── email（未引用，subagent 无邮件通道）─────────────────────────────
+# email:
+#   enabled: true
+#   imap:
+#     host: imap.qq.com
+#     port: 993
+#     ssl: true
+#     username: 1000000001@qq.com
+#     password: ${EMAIL_IMAP_PASSWORD}
+#   smtp:
+#     host: smtp.qq.com
+#     port: 465
+#     ssl: true
+#     username: 1000000001@qq.com
+#     password: ${EMAIL_SMTP_PASSWORD}
+
+# ── workspace_tools 文件工具（暂未实现，未引用）─────────────────────
+# workspace_tools:
+#   enabled: true
+#   container: resident-sandbox
+#   exec_default_timeout_seconds: 10
+#   exec_output_max_chars: 20000
+#   truncated_dir: ./data/workspace/.truncated
+#   exec_async_timeout_seconds: 600
+#   exec_async_workers: 2
+#   exec_async_log_dir: ./data/workspace/.tasks_log
+#   read_max_bytes: 65535
+#   read_max_lines: 1000
+#   read_warn_bytes: 32768
+#   read_default_line_numbers: true
+#   glob_max_results: 100
+#   glob_timeout_seconds: 10
+#   grep_head_limit: 250
+#   grep_max_columns: 500
+#   edit_max_old_chars: 20000
+#   edit_output_max_chars: 20000
+#   write_max_bytes: 262144
+
+# ── http 流式接口（未引用，subagent hub 用自己端口）─────────────────
+# http:
+#   host: 127.0.0.1
+#   port: 18086
+#   api_key: ${RESIDENT_API_KEY}
+#   stream_history: 200
+#   stream_heartbeat: 15
+
+# ── LLM 模型配置（多个，spawn/switch_model 时按配置名指定；引用：
+#    factory.create_llm_client 用所选 profile 的字段）────────────────
+# 每个 profile 是一份完整 llm 配置（protocol/variant/base_url/api_key/model/
+# timeout_seconds/retries/options/extra_params/backoff 等）。
+llm_profiles:
+  default:
+    protocol: openai-compatible
+    variant: deepseek
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    model: deepseek-v4-flash
+    timeout_seconds: 600
+    retries: 2
+    retry_delay_seconds: 1.5
+    backoff_base: 2.0
+    retry_cap_seconds: 60.0
+    options:
+      reasoning_effort: medium
+      max_tokens: 32768
+    extra_params: {}
+  # OpenCode 09-04 官宣 stealth 匿名模型（设计约定接入实测）
+  # 09-05 20:3x 实测确认支持 reasoning_effort（low/medium/high/minimal 都认，
+  # 非严格单调），约定默认 medium 控思考长度。
+  匿名模型:
+    protocol: openai-compatible
+    variant: deepseek
+    base_url: ${LLM_BASE_URL}
+    api_key: ${LLM_API_KEY}
+    model: 匿名模型
+    timeout_seconds: 600
+    retries: 2
+    retry_delay_seconds: 1.5
+    backoff_base: 2.0
+    retry_cap_seconds: 60.0
+    options:
+      max_tokens: 32768
+      reasoning_effort: medium   # 09-05 20:3x 约定默认 medium
+    extra_params: {}
+
+# ── 上下文压缩（引用：push_event 后/手动端点触发，只做 step2 无 memory 提取）─
+# enabled=false 时 hub 不建压缩 LLM、不自动压缩、手动端点返回未启用。
+# max_tokens=窗口上限（上下文 token 总量），threshold=自动触发阈值比例，
+#   满足 total > max_tokens*threshold 时自动压缩。
+# llm_profile=独立压缩模型（引用上方 llm_profiles 里的某个 profile 名）；
+#   不写或留空则复用主 agent 的 LLM。
+# 归档：旧 context 备份到 skill_data/subagent/<session>/compressed/（每 session
+#   独立，设计约定）。不能配全局路径，必须进 session 领地。
+compression:
+  enabled: true
+  max_tokens: 262144
+  threshold: 0.8
+  keep_recent_tokens: 16000
+  summary_prompt_file: config/prompt/compression_summary.md
+  llm_profile: 匿名模型   # 09-05 设计约定：试 匿名模型 做 subagent 上下文压缩
+  manual_timeout_s: 180   # 引用：手动压缩（POST /compress）阻塞等待上限（秒）；大上下文可调大
+
+# ── hub：subagent 常驻入口（引用）───────────────────────────────────
+# HTTP 监听，管理 agent 实例。端点为：
+#   POST /api/agents                      注册实例 {name, system_prompt}
+#   GET  /api/agents/<name>/context       读实例 context.jsonl
+#   POST /api/agents/<name>/prompt        发 prompt {content}
+#   POST /api/agents/<name>/close         关闭实例
+hub:
+  host: 127.0.0.1
+  port: 19711
+
+# ── exec 命令执行工具（引用：workspace_tools.exec）──────────────────
+# whitelist: 命令白名单（只填命令名，不含参数；参数不算独立命令）。
+#    命令名 = 命令行的第一个词（如 `python3 script.py` → 命令名 python3）。
+# approval_timeout_s: exec 审批阻塞最大等待秒数（超时按拒绝处理）。
+# 执行前流程：cd 到工作区 → 扫描命令行中所有疑似路径（绝对/相对，URL 除外）
+#    逐个用 check_path 校验合法性 → 命令名是否在白名单。全部合规才直接执行；
+#    否则触发审批（notice 通知用户），阻塞等待 /api/agents/<name>/approve。
+#    被拒绝（或超时）→ 工具返回 403 拒绝码，不执行；框架不 call，仅写上下文。
+exec:
+  whitelist: [ls, pwd, cat, python3, python, grep, find, head, tail, wc, mkdir, touch, echo]
+  approval_timeout_s: 300
+
+# ── workspace 文件工具配置（引用：workspace_tools 的 read/write/edit/...）─
+# 所有含 path 参数的工具执行前先 check_path 校验路径是否在工作区内；
+# 越界 → 触发审批（与 exec 相同）：approve 放行执行、reject 拒绝(403)。
+# 限额变量在此配置，避免代码硬编码（设计约定 设计原则）。
+workspace_tools:
+  # 安全删除（delete 工具）的回收站目录：文件移入此处而非真删，
+  # 重名自动加时间戳后缀（2026-09-05 设计约定"堵不如疏"）。
+  trash_dir: /home/sandbox/trash
+  read_max_bytes: 65535
+  read_max_lines: 1000
+  read_warn_bytes: 32768
+  read_default_line_numbers: true
+  glob_max_results: 100
+  grep_head_limit: 250
+  grep_max_columns: 500
+  edit_max_old_chars: 20000
+  edit_output_max_chars: 20000
+  write_max_bytes: 262144
+  exec_default_timeout_s: 60
