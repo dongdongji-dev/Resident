@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from kernel.agent_framework.logging_setup import get_logger
+from kernel.agent_framework.paths import open_file_inside
 from kernel.agent_framework.sandbox import WorkspaceExecutor
 from kernel.agent_framework.tools import ToolRegistry
 
@@ -146,11 +147,13 @@ def _save_artifact(executor: WorkspaceExecutor, truncated_dir: str,
         return ""
     try:
         directory = os.path.abspath(truncated_dir)
-        os.makedirs(directory, exist_ok=True)
         filename = (f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_"
                     f"{uuid.uuid4().hex[:6]}.txt")
         host = os.path.join(directory, filename)
-        Path(host).write_text(str(text), encoding="utf-8")
+        with open_file_inside(host, executor.workspace.host_root, "w",
+                              create_parents=True,
+                              encoding="utf-8") as handle:
+            handle.write(str(text))
         return executor.runtime_path(host)
     except Exception:  # noqa: BLE001 — 缓存失败不掩盖主结果
         return ""

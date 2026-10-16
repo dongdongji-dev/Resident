@@ -28,6 +28,7 @@ from kernel.agent_framework.config import parse_input_modalities
 from kernel.agent_framework.content import (image_url, is_image_block, text_of)
 from kernel.agent_framework.context import ContextStore
 from kernel.agent_framework.logging_setup import get_logger
+from kernel.agent_framework.paths import open_file_inside
 from kernel.agent_framework.timeutil import now_str
 
 logger = get_logger("kernel.agent_framework.compression")
@@ -296,21 +297,33 @@ async def _llm_text(llm: Any, system_prompt: str, user_text: str,
 
 
 # ── step 1: memory extraction ──────────────────────────────────────────
-def append_memory(text: str, memory_file: str, trigger_time: str) -> str:
+def append_memory(text: str, memory_file: str, trigger_time: str,
+                  memory_root: str = "") -> str:
     """Append the model's output verbatim to the memory file, with a
     ``-----`` separator and the trigger time at the block head. Append-only
     so multiple blocks (even multiple files over time) coexist."""
     path = Path(memory_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
     block = f"----- {trigger_time}\n\n{str(text).strip()}\n\n"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(block)
+    try:
+        if memory_root:
+            with open_file_inside(str(path), memory_root, "a",
+                                  create_parents=True,
+                                  encoding="utf-8") as handle:
+                handle.write(block)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(block)
+    except (OSError, ValueError) as exc:
+        logger.warning("memory append failed: %s", exc)
+        return ""
     return str(path)
 
 
 async def extract_memory(llm: Any, entries: list[dict],
                          memory: MemoryConfig,
-                         max_input_chars: int = 0) -> str:
+                         max_input_chars: int = 0,
+                         memory_root: str = "") -> str:
     """Run the extraction prompt; write the FIRST output verbatim. Returns
     the output text ('' when empty). This call has NO tools and a single
     user message — the prompt must not ask the model to read files."""
@@ -322,7 +335,8 @@ async def extract_memory(llm: Any, entries: list[dict],
     if not text.strip():
         logger.info("memory extraction: empty output, nothing written")
         return ""
-    path = append_memory(text, memory.file, now_str())
+    path = append_memory(text, memory.file, now_str(),
+                         memory_root=memory_root)
     logger.info("memory appended -> %s (%d chars)", path, len(text))
     return text
 
@@ -449,7 +463,8 @@ async def _with_retry(description: str,
 # ── orchestrator ───────────────────────────────────────────────────────
 async def compress_context(context: ContextStore, llm: Any,
                            config: CompressionConfig,
-                           force: bool = False) -> Optional[str]:
+                           force: bool = False,
+                           memory_root: str = "") -> Optional[str]:
     """Run the two-step compression; returns the summary (None when not
     triggered). ``force=True`` compresses even below the token threshold
     (e.g. a byte-budget relief requested via os.db system_vars). Step-1/
@@ -524,7 +539,8 @@ async def compress_context(context: ContextStore, llm: Any,
             await _with_retry(
                 "memory extraction",
                 lambda: extract_memory(llm, work_entries, config.memory,
-                                       config.max_input_chars))
+                                       config.max_input_chars,
+                                       memory_root=memory_root))
 
     async def run_summarize() -> Optional[str]:
         return await _with_retry(

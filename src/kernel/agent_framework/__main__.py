@@ -280,7 +280,8 @@ def build_agent(config: dict,
                       make_messages_download(
                           messages, mt_cfg["download_dir"],
                           runtime_path=(executor.runtime_path
-                                        if executor is not None else None)))
+                                        if executor is not None else None),
+                          workspace_root=workspace.host_root))
     # skills_load 工具（按需加载 SKILL.md 全文）
     if rc.skills_enabled:
         registry.register("skills_load",

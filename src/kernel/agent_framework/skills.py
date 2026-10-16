@@ -58,11 +58,24 @@ def scan_skills(skills_dir: str) -> list[dict]:
     try:
         if not os.path.isdir(skills_dir):
             return []
-        for entry in sorted(os.listdir(skills_dir)):
+        root_dir = os.path.abspath(skills_dir)
+        if os.path.islink(root_dir):
+            logger.warning("skills dir is a symlink; scan refused: %s",
+                           root_dir)
+            return []
+        for entry in sorted(os.listdir(root_dir)):
             name = entry.strip("/")
             if not name or name.startswith(".") or "/" in name or "\\" in name:
                 continue
-            skill_md = os.path.join(skills_dir, name, "SKILL.md")
+            skill_dir = os.path.join(root_dir, name)
+            if os.path.islink(skill_dir):
+                logger.warning("skill dir is a symlink; skipped: %s", name)
+                continue
+            skill_md = os.path.join(skill_dir, "SKILL.md")
+            if os.path.islink(skill_md):
+                logger.warning("skill SKILL.md is a symlink; skipped: %s",
+                               name)
+                continue
             if not os.path.isfile(skill_md):
                 continue
             try:
@@ -104,6 +117,11 @@ def load_skill(skills_dir: str, name: str) -> Optional[str]:
             or ".." in name.split("/") or "/" in name or "\\" in name):
         return None
     path = os.path.join(skills_dir, name, "SKILL.md")
+    if (os.path.islink(skills_dir)
+            or os.path.islink(os.path.join(skills_dir, name))
+            or os.path.islink(path)):
+        logger.warning("skill path is a symlink; refused: %s", path)
+        return None
     if not os.path.isfile(path):
         return None
     try:
@@ -159,9 +177,15 @@ def list_skills(skills_dir: str) -> list[dict[str, Any]]:
     root = Path(skills_dir)
     if not root.is_dir():
         return []
+    if root.is_symlink():
+        logger.warning("skills dir is a symlink; listing refused: %s", root)
+        return []
     result: list[dict[str, Any]] = []
     for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
         if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if entry.is_symlink():
+            logger.warning("skill dir is a symlink; skipped: %s", entry.name)
             continue
         files = 0
         total = 0
@@ -203,7 +227,12 @@ def skill_detail(skills_dir: str, name: str, max_chars: int = 0) -> Optional[str
     safe = sanitize_skill_name(name)
     if not safe:
         return None
-    path = Path(skills_dir) / safe / "SKILL.md"
+    root = Path(skills_dir)
+    path = root / safe / "SKILL.md"
+    if (root.is_symlink() or (root / safe).is_symlink()
+            or path.is_symlink()):
+        logger.warning("skill detail path is a symlink; refused: %s", path)
+        return None
     if not path.is_file():
         return None
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -296,6 +325,8 @@ def install_skill_zip(data: bytes, *, skills_dir: str, backup_dir: str,
     再次上传文件名（去扩展名）。同名时旧版备份到 ``backup_dir``。
     返回 {name, files, bytes, backup}；失败抛 ValueError（中文原因）。
     """
+    if Path(skills_dir).is_symlink():
+        raise ValueError("skills 目录异常（符号链接），已拒绝安装")
     if not data:
         raise ValueError("空文件")
     if max_zip_bytes > 0 and len(data) > max_zip_bytes:
@@ -363,6 +394,8 @@ def delete_skill(name: str, *, skills_dir: str, trash_dir: str) -> dict[str, Any
     safe = sanitize_skill_name(name)
     if not safe:
         raise ValueError(f"非法 skill 名称: {name!r}")
+    if Path(skills_dir).is_symlink():
+        raise ValueError("skills 目录异常（符号链接），已拒绝删除")
     target = Path(skills_dir) / safe
     if not target.is_dir():
         raise ValueError(f"skill 不存在: {safe}")

@@ -55,6 +55,7 @@ from typing import Any, Optional
 
 from kernel.agent_framework.content import text_of
 from kernel.agent_framework.logging_setup import get_logger
+from kernel.agent_framework.paths import open_file_inside
 from kernel.agent_framework.timeutil import now_str
 from kernel.osdb.messages import MessagesStore
 from kernel.osdb.notice import NoticeStore
@@ -639,11 +640,13 @@ class Beat:
             return None
         try:
             directory = Path(self._truncated_dir)
-            directory.mkdir(parents=True, exist_ok=True)
             filename = (f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}.txt")
-            (directory / filename).write_text(text, encoding="utf-8")
             host = str(directory / filename)
+            with open_file_inside(host, workspace.host_root, "w",
+                                  create_parents=True,
+                                  encoding="utf-8") as handle:
+                handle.write(text)
             resolver = getattr(self._agent, "runtime_path", None)
             if callable(resolver):
                 try:

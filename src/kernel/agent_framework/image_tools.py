@@ -22,6 +22,8 @@ Byte-budget rules (all from YAML, no hidden defaults):
 from __future__ import annotations
 
 import base64
+import functools
+import http.client
 import ipaddress
 import json
 import os
@@ -42,7 +44,8 @@ from PIL import Image
 
 from kernel.agent_framework.events import EventTooLargeError
 from kernel.agent_framework.logging_setup import get_logger
-from kernel.agent_framework.paths import PathEscapeError, WorkspacePath
+from kernel.agent_framework.paths import (PathEscapeError, WorkspacePath,
+                                          open_file_inside)
 
 logger = get_logger("kernel.agent_framework.image_tools")
 
@@ -278,47 +281,180 @@ def _is_private_host(host: str) -> bool:
     return False
 
 
-def _download_image(url: str, config: ReadImageConfig) -> bytes:
-    """Download an external image with scheme/host/size guards. Raises
-    ValueError with a user-facing reason."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"仅支持 http(s) 图片地址：{url}")
-    if not config.allow_private_hosts and _is_private_host(parsed.hostname or ""):
-        raise ValueError("拒绝访问内网/回环地址（readimage.allow_private_hosts=false）")
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Dial a pre-validated IP; the Host header still uses the URL host."""
+
+    def __init__(self, host: str, *, pinned_ip: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Same as above for TLS; SNI/certificate still use the URL host."""
+
+    def __init__(self, host: str, *, pinned_ip: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, pinned_ip: str) -> None:
+        super().__init__()
+        self._pinned_ip = pinned_ip
+
+    def http_open(self, req: Any) -> Any:
+        factory = functools.partial(_PinnedHTTPConnection,
+                                    pinned_ip=self._pinned_ip)
+        return self.do_open(factory, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, pinned_ip: str) -> None:
+        super().__init__(context=_tls_context())
+        self._pinned_ip = pinned_ip
+
+    def https_open(self, req: Any) -> Any:
+        factory = functools.partial(_PinnedHTTPSConnection,
+                                    pinned_ip=self._pinned_ip)
+        return self.do_open(factory, req, context=self._context)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        return None  # 重定向上层手动逐跳处理（每跳重新解析+校验）
+
+
+def _resolve_public_ip(hostname: str) -> str:
+    """Resolve ONCE and validate; returns the address to pin. Any private /
+    loopback / link-local / reserved result refuses the request — the same
+    policy as before, but the validated address is reused for the actual
+    connection, so a second DNS answer (rebinding) can never be dialed."""
+    value = str(hostname or "").strip().strip("[]")
+    if not value:
+        raise ValueError("图片地址缺少主机名")
+    try:
+        infos = socket.getaddrinfo(value, None)
+    except OSError as exc:
+        raise ValueError(f"域名解析失败：{value}") from exc
+    pinned = ""
+    for info in infos:
+        address = info[4][0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ValueError(f"无法识别的地址：{address}") from exc
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError("拒绝访问内网/回环地址"
+                             "（readimage.allow_private_hosts=false）")
+        if not pinned:
+            pinned = address
+    if not pinned:
+        raise ValueError(f"域名解析不到地址：{value}")
+    return pinned
+
+
+def _pinned_opener(scheme: str, pinned_ip: str) -> Any:
+    """Opener whose connections dial ONLY the validated IP (no proxy env:
+    a proxy would re-resolve the name and defeat the pinning)."""
+    if scheme == "https":
+        return urllib.request.build_opener(
+            _PinnedHTTPSHandler(pinned_ip), urllib.request.ProxyHandler({}),
+            _NoRedirect())
+    return urllib.request.build_opener(
+        _PinnedHTTPHandler(pinned_ip), urllib.request.ProxyHandler({}),
+        _NoRedirect())
+
+
+def _read_capped(resp: Any, config: ReadImageConfig) -> bytes:
+    length = resp.headers.get("Content-Length")
+    if length and length.isdigit() and int(length) > config.max_input_bytes:
+        raise ValueError(
+            f"远程图片 {length} 字节超过上限 "
+            f"{config.max_input_bytes} 字节")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > config.max_input_bytes:
+            raise ValueError(
+                f"远程图片超过上限 {config.max_input_bytes} 字节")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _download_plain(url: str, config: ReadImageConfig) -> bytes:
+    """Direct download when the user explicitly allows private hosts."""
     request = urllib.request.Request(url, headers={
         "User-Agent": "resident-agent/1.0", "Accept": "image/*"})
     try:
         with urllib.request.urlopen(
                 request, timeout=config.url_timeout_seconds,
                 context=_tls_context()) as resp:
-            final_host = urllib.parse.urlparse(resp.geturl()).hostname or ""
-            if not config.allow_private_hosts and _is_private_host(final_host):
-                raise ValueError("重定向到内网/回环地址，已拒绝")
-            length = resp.headers.get("Content-Length")
-            if length and length.isdigit() \
-                    and int(length) > config.max_input_bytes:
-                raise ValueError(
-                    f"远程图片 {length} 字节超过上限 "
-                    f"{config.max_input_bytes} 字节")
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > config.max_input_bytes:
-                    raise ValueError(
-                        f"远程图片超过上限 {config.max_input_bytes} 字节")
-                chunks.append(chunk)
+            return _read_capped(resp, config)
     except ValueError:
         raise
     except urllib.error.HTTPError as exc:
         raise ValueError(f"下载失败 HTTP {exc.code}") from exc
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"下载失败：{exc}") from exc
-    return b"".join(chunks)
+
+
+def _download_image(url: str, config: ReadImageConfig) -> bytes:
+    """Download an external image with scheme/host/size guards. Raises
+    ValueError with a user-facing reason.
+
+    防 SSRF 的方式：每一跳先解析（getaddrinfo）→ 校验 → **把校验过的 IP
+    钉在连接上**（Host/SNI 仍用域名），域名不会被第二次解析，DNS rebinding
+    无从生效；重定向手动逐跳处理，每一跳都重新解析+校验。
+    allow_private_hosts=true 时退回普通 urlopen。"""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"仅支持 http(s) 图片地址：{url}")
+    if config.allow_private_hosts:
+        return _download_plain(url, config)
+    current = url
+    for _ in range(5):
+        parsed = urllib.parse.urlparse(current)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"仅支持 http(s) 图片地址：{current}")
+        pinned_ip = _resolve_public_ip(parsed.hostname or "")
+        opener = _pinned_opener(parsed.scheme, pinned_ip)
+        request = urllib.request.Request(current, headers={
+            "User-Agent": "resident-agent/1.0", "Accept": "image/*"})
+        try:
+            resp = opener.open(request,
+                               timeout=config.url_timeout_seconds)
+        except ValueError:
+            raise
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                location = str(exc.headers.get("Location") or "").strip()
+                if not location:
+                    raise ValueError(
+                        f"下载失败：重定向缺少 Location"
+                        f"（HTTP {exc.code}）") from exc
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise ValueError(f"下载失败 HTTP {exc.code}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"下载失败：{exc}") from exc
+        with resp:
+            return _read_capped(resp, config)
+    raise ValueError("重定向次数过多，已中止")
 
 
 def _flatten(img: Image.Image) -> Image.Image:
@@ -446,8 +582,10 @@ def make_readimage(agent: Any, workspace: WorkspacePath,
                 return (f"读取失败：原图 {size} 字节超过上限 "
                         f"{config.max_input_bytes} 字节")
             try:
-                raw = Path(host).read_bytes()
-            except OSError as exc:
+                with open_file_inside(host, workspace.host_root,
+                                      "rb") as fh:
+                    raw = fh.read()
+            except (OSError, ValueError) as exc:
                 return f"读取失败：{exc}"
             filename = os.path.basename(host)
             label = source

@@ -43,7 +43,8 @@ from typing import Optional
 BACKGROUND_DONE_PREFIX = "[后台任务完成 #"
 
 from kernel.agent_framework.logging_setup import get_logger
-from kernel.agent_framework.paths import WorkspacePath
+from kernel.agent_framework.paths import (WorkspacePath, open_file_inside,
+                                          replace_text_inside)
 from kernel.agent_framework.timeutil import now_str
 from kernel.osdb.notice import NoticeStore
 
@@ -254,9 +255,11 @@ class WorkspaceExecutor:
     def _write_log(self, task_id: str, record: dict) -> None:
         path = os.path.join(self._config.async_log_dir, f"{task_id}.json")
         try:
-            with open(path, "w", encoding="utf-8") as handle:
+            with open_file_inside(path, self._workspace.host_root, "w",
+                                  create_parents=True,
+                                  encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False, indent=2)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("sandbox task log write failed: %s", exc)
 
     def shutdown(self) -> None:
@@ -323,18 +326,20 @@ class SandboxExecutor(WorkspaceExecutor):
         """Keep the runtime copy of fsops.py in sync with this package's
         source (cheap re-check each startup / first use after edits)."""
         try:
-            current = Path(self._fsops_host).read_text(encoding="utf-8")
-        except OSError:
+            with open_file_inside(self._fsops_host,
+                                  self._workspace.host_root,
+                                  "r", encoding="utf-8") as handle:
+                current = handle.read()
+        except (OSError, ValueError):
             current = None
         if current == self._fsops_source:
             return
         try:
-            os.makedirs(os.path.dirname(self._fsops_host), exist_ok=True)
-            tmp = self._fsops_host + ".tmp"
-            Path(tmp).write_text(self._fsops_source, encoding="utf-8")
-            os.replace(tmp, self._fsops_host)
+            replace_text_inside(self._fsops_host, self._fsops_source,
+                                self._workspace.host_root,
+                                create_parents=True)
             logger.info("fsops synced to %s", self._fsops_container)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("fsops sync failed: %s", exc)
 
     def _run(self, cmd: str, timeout: float, stdin: Optional[str],

@@ -7,7 +7,7 @@ import os
 from typing import Any, Optional
 
 from kernel.agent_framework.logging_setup import get_logger
-from kernel.agent_framework.paths import WorkspacePath
+from kernel.agent_framework.paths import WorkspacePath, open_file_inside
 from kernel.osdb.notice import NoticeStore
 
 logger = get_logger("kernel.agent_framework.notice_tools")
@@ -21,13 +21,14 @@ def _save_cutoff(workspace: WorkspacePath, text: str, prefix: str,
         return None
     try:
         directory = os.path.abspath(truncated_dir)
-        os.makedirs(directory, exist_ok=True)
         import time as _time
         import uuid as _uuid
         filename = (f"{prefix}_{_time.strftime('%Y%m%d_%H%M%S')}_"
                     f"{_uuid.uuid4().hex[:6]}.txt")
         host = os.path.join(directory, filename)
-        with open(host, "w", encoding="utf-8") as handle:
+        with open_file_inside(host, workspace.host_root, "w",
+                              create_parents=True,
+                              encoding="utf-8") as handle:
             handle.write(str(text))
         return workspace.to_container(host)
     except Exception:  # noqa: BLE001

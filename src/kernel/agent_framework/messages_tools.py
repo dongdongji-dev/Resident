@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kernel.agent_framework.logging_setup import get_logger
+from kernel.agent_framework.paths import open_file_inside
 from kernel.osdb.messages import MessagesStore
 
 logger = get_logger("kernel.agent_framework.messages_tools")
@@ -376,7 +377,8 @@ def make_messages_detail(store: MessagesStore, config: dict) -> Any:
 
 
 def make_messages_download(store: MessagesStore, download_dir: str,
-                           runtime_path: Any = None) -> Any:
+                           runtime_path: Any = None,
+                           workspace_root: str = "") -> Any:
     def download(conv_keys: list[str],
                  include_archive: bool = False) -> dict[str, Any]:
         """把指定消息（conv_keys）的全部记录导出为 jsonl 文件。
@@ -400,11 +402,16 @@ def make_messages_download(store: MessagesStore, download_dir: str,
         messages = store.messages_by_keys(
             keys, include_archive=bool(include_archive), limit=100000)
         directory = Path(download_dir)
-        directory.mkdir(parents=True, exist_ok=True)
         filename = (f"messages_{time.strftime('%Y%m%d_%H%M%S')}"
                     f"_{len(messages)}.jsonl")
         path = directory / filename
-        with path.open("w", encoding="utf-8") as handle:
+        if workspace_root:
+            handle = open_file_inside(str(path), workspace_root, "w",
+                                      create_parents=True, encoding="utf-8")
+        else:
+            directory.mkdir(parents=True, exist_ok=True)
+            handle = path.open("w", encoding="utf-8")
+        with handle:
             for message in messages:
                 handle.write(json.dumps(message, ensure_ascii=False)
                              + "\n")

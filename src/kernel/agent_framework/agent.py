@@ -725,9 +725,11 @@ class Agent:
             return
         self._set_state(AgentState.COMPRESS)
         try:
+            workspace = getattr(self, "workspace", None)
             summary = await compress_context(
                 self.context, self.compression_llm or self.llm,
-                self.compression, force=force)
+                self.compression, force=force,
+                memory_root=(workspace.host_root if workspace else ""))
             if summary is not None:
                 self._publish({"type": "context_compressed",
                                "summary": summary})
