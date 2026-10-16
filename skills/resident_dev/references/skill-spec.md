@@ -114,7 +114,7 @@ inputs:
 
 | 方向 | 接口 |
 |---|---|
-| 入站（唤醒 agent） | `POST http://host.docker.internal:18086/api/notice`（事件类）或 `/api/messages`（对话类），带 `X-Api-Token` |
+| 入站（唤醒 agent） | `POST http://<宿主>:18086/api/notice`（事件类）或 `/api/messages`（对话类），带 `X-Api-Token`；`<宿主>` 取 `127.0.0.1`（docker / Linux host）或 `host.docker.internal`（macOS / Windows host），详见 `references/http-api.md` |
 | 出站（agent 操作它） | agent 调该 skill 自持的 HTTP 端点（由 `actions/` 脚本封装） |
 
 密钥/令牌一律从 `.secrets/` 读，不硬编码、不进配置明文。

@@ -7,11 +7,14 @@
 
 | 服务 | 地址 | 用途 |
 |---|---|---|
-| core（kernel） | `http://host.docker.internal:18086` | Agent 本体：状态/上下文/消息库/通知 |
-| events_port | `http://host.docker.internal:18087` | 投递「未定义事件」给 kernel（当前仅入队记录） |
-| console | `http://host.docker.internal:18082` | 前端/管理面（非 Agent 主要使用） |
+| core（kernel） | `http://<宿主>:18086` | Agent 本体：状态/上下文/消息库/通知 |
+| events_port | `http://<宿主>:18087` | 投递「未定义事件」给 kernel（当前仅入队记录） |
+| console | `http://<宿主>:18082` | 前端/管理面（非 Agent 主要使用） |
 
-- 沙箱内经 **`host.docker.internal`** 访问宿主；**沙箱内 `127.0.0.1` 不通**。
+- `<宿主>` 按部署方式取：
+  - **docker 模式、Linux host 模式** → `127.0.0.1`
+  - **macOS / Windows host 模式** → `host.docker.internal`
+- 拿不准就**先试 `127.0.0.1:<端口>`，不通再换 `host.docker.internal:<端口>`**。
 - 认证：请求头 `X-Api-Token: <key>` 或 `Authorization: Bearer <key>`；**SSE 只能 `?token=<key>`**。
 - key 源：`/home/sandbox/.secrets/core_api_key.txt`（`core_api_key=` 那行的右值，权限 600）。
   ⚠️ 文件前几行是 `#` 注释，解析要跳注释取含 `=` 行；沙箱 `HOME=/root`，路径一律写死 `/home/sandbox`。
@@ -56,14 +59,15 @@ import urllib.request, json
 key = open('/home/sandbox/.secrets/core_api_key.txt').read()
 key = [l for l in key.splitlines() if l.startswith('core_api_key=')][0].split('=',1)[1].strip()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # ⚠️ 空 ProxyHandler
-req = urllib.request.Request('http://host.docker.internal:18086/api/state',
+base = 'http://127.0.0.1:18086'   # macOS/Windows host 模式改为 http://host.docker.internal:18086
+req = urllib.request.Request(base + '/api/state',
                              headers={'X-Api-Token': key})
 print(json.load(opener.open(req, timeout=6)))
 ```
 
 ## 4. 实测坑（踩过，别再踩）
 
-- **curl 直连会返回 500（假故障）**：代理变量没屏蔽时，curl 把 `host.docker.internal:18086` 交给宿主代理 → 所有端点 500，看着像 core 全挂。用 `curl --noproxy '*'`，或 python 空 `ProxyHandler({})`。
+- **curl 直连会返回 500（假故障）**：代理变量没屏蔽时，curl 把 `<宿主>:18086` 的请求交给宿主代理 → 所有端点 500，看着像 core 全挂。用 `curl --noproxy '*'`，或 python 空 `ProxyHandler({})`。
 - **`after_seq` 是「取比它大的」**：`after_seq=N` 返回 seq>N 的消息、**按 seq 升序**；不带 `after_seq` 是**从头**给前 `limit` 条（不是最新）。要拿最新一条 → 二分找最大 seq，再每次 `after_seq=<上次最大>` 取增量。
 - **`GET /api/messages` 必须带 `platform` 与 `conversation_id`**，否则 400。平台名形如 `qq[1000000001]`（URL 编码）。
 - **出站 `content` 带前缀**：DB 里出站消息带 `[reply]` / `[at xxx]` 前缀，比对内容前先剥掉。

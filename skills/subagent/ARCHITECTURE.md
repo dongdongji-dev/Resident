@@ -542,5 +542,6 @@ config 不硬编码）、`load_prompt_files`（按声明顺序加载、缺失跳
 ---
 
 *文末注：本文基于源码逐文件阅读写成，所有行为描述均可在对应模块中找到真实实现。
-架构分层图中 `kernel.agent_framework` 经 `src/kernel/agent_framework` 符号链接映射
-到 `src/agent_framework/`（`kernel` 是运行期的别名包）。*
+架构分层图中 `kernel.agent_framework` 经 `src/kernel/agent_framework` 的
+`__path__` 重定向映射到 `src/agent_framework/`（原实现为符号链接，zip 分发 /
+Windows 解压会丢失；`kernel` 是运行期的别名包）。*
