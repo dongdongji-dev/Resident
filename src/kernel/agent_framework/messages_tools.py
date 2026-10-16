@@ -19,6 +19,7 @@ conversation_key（三段含消息 id）是消息级唯一键，注意区分。
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional

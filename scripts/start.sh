@@ -74,13 +74,27 @@ fi
 mkdir -p "$HOST_WORKSPACE"
 if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
   echo "沙箱容器不存在，创建 $CONTAINER …"
-  docker create --name "$CONTAINER" \
-    --add-host host.docker.internal:host-gateway \
-    -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
-    -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
-    -v "$HOST_WORKSPACE:/home/sandbox" \
-    -p "${RESIDENT_SANDBOX_PORT:-19090}:19090" \
-    "$IMAGE:latest" >/dev/null
+  if [ "$(uname -s)" = "Linux" ]; then
+    # Linux：与宿主同网络（沙箱内 127.0.0.1 直达宿主 console/kernel）
+    docker create --name "$CONTAINER" \
+      --network host \
+      -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
+      -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
+      -v "$HOST_WORKSPACE:/home/sandbox" \
+      "$IMAGE:latest" >/dev/null
+  else
+    docker create --name "$CONTAINER" \
+      --add-host host.docker.internal:host-gateway \
+      -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
+      -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
+      -v "$HOST_WORKSPACE:/home/sandbox" \
+      -p "${RESIDENT_SANDBOX_PORT:-19090}:19090" \
+      "$IMAGE:latest" >/dev/null
+  fi
+elif [ "$(uname -s)" = "Linux" ] \
+     && [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER" 2>/dev/null || true)" != "host" ]; then
+  echo "提示：沙箱容器为旧网络模式（bridge），沙箱内无法直达宿主 kernel/console。" >&2
+  echo "      重建生效（工作区数据不丢）：docker rm -f $CONTAINER 后重跑 scripts/start.sh" >&2
 fi
 if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)" != "true" ]; then
   docker start "$CONTAINER" >/dev/null

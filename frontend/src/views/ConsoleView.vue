@@ -105,23 +105,23 @@ onBeforeUnmount(() => { /* 定时器随组件销毁 */ });
 <style scoped>
 .console { display: flex; flex-direction: column; height: 100%; }
 .console-header { display: flex; align-items: center; gap: 12px;
-  padding: 10px 16px; border-bottom: 1px solid #2a2a31; flex-wrap: wrap; }
+  padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
 h2 { font-size: 15px; }
-.meta { font-size: 12px; color: #9da3ad; }
+.meta { font-size: 12px; color: var(--dim); }
 .actions { margin-left: auto; display: flex; gap: 8px; }
 .filters { display: flex; gap: 8px; padding: 8px 16px;
-  border-bottom: 1px solid #2a2a31; align-items: center; flex-wrap: wrap; }
+  border-bottom: 1px solid var(--line); align-items: center; flex-wrap: wrap; }
 .log-area { flex: 1; overflow-y: auto; padding: 8px 14px;
   font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.6; }
 .line { display: flex; gap: 10px; padding: 1px 4px; border-radius: 4px;
   white-space: pre-wrap; word-break: break-all; }
-.line:hover { background: #1b1b21; }
-.t-time { color: #8b8b96; flex-shrink: 0; }
-.t-thread { color: #6e7681; flex-shrink: 0; }
+.line:hover { background: var(--hover); }
+.t-time { color: var(--dim); flex-shrink: 0; }
+.t-thread { color: var(--dim); flex-shrink: 0; }
 .t-level { flex-shrink: 0; font-weight: 700; width: 66px; }
-.lv-ERROR { color: #f85149; } .lv-WARNING { color: #d29922; }
-.lv-INFO { color: #3fb950; } .lv-DEBUG { color: #8b8b96; }
-.t-logger { color: #bc8cff; flex-shrink: 0; }
-.line.ERROR .t-msg { color: #f85149; }
-.line.WARNING .t-msg { color: #d29922; }
+.lv-ERROR { color: var(--err); } .lv-WARNING { color: var(--warn); }
+.lv-INFO { color: var(--info); } .lv-DEBUG { color: var(--debug); }
+.t-logger { color: var(--logger); flex-shrink: 0; }
+.line.ERROR .t-msg { color: var(--err); }
+.line.WARNING .t-msg { color: var(--warn); }
 </style>

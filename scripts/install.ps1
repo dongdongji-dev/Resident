@@ -618,6 +618,7 @@ function Write-Summary([bool]$NoStart) {
     Write-Host '    改监听：.env RESIDENT_CONSOLE_BIND（改后 start）'
     Write-Host '    改图床：config/agent.yaml imgbed + .env IMGBED_API_KEY；readimage.mode'
     Write-Host '    改邮箱：config/agent.yaml email + .env EMAIL_IMAP/SMTP_PASSWORD'
+    Write-Host '    改人设：config/prompt/user/persona.md（自定义系统提示词，下一轮生效）'
     Write-Host '    加技能：目录拷入 data/workspace/.skills/'
 }
 
@@ -819,6 +820,21 @@ Step '工作区与技能'
 Invoke-InitWorkspace
 Invoke-SeedSkill 'resident_dev'
 Invoke-SeedSkill 'subagent'
+
+# subagent notice 回推地址：host 模式（Windows/Docker Desktop）沙箱为桥接
+# 容器，127.0.0.1 打不到宿主 kernel，写 local.yaml 覆盖为 host.docker.internal；
+# docker 模式（共享网络命名空间）默认 127.0.0.1 即可，不写。
+$subLocal = Join-Path $Root 'data/workspace/.skills/subagent/config/local.yaml'
+if ($Mode -eq 'host' -and -not (Test-Path $subLocal)) {
+    Invoke-Run '写入 subagent local.yaml' {
+        $subDir = Join-Path $Root 'data/workspace/.skills/subagent/config'
+        New-Item -ItemType Directory -Force -Path $subDir | Out-Null
+        [System.IO.File]::WriteAllText($subLocal,
+            "# 本机覆盖（由安装脚本生成；通用默认见 config/default.yaml）`nnotice:`n  url: http://host.docker.internal:18086/api/notice`n",
+            (New-Utf8NoBom))
+    }
+    Info '已为 subagent 写入 local.yaml（host.docker.internal）'
+}
 
 if ($Mode -eq 'host') {
     Invoke-HostInstall

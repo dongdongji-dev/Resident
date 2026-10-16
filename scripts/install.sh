@@ -449,13 +449,30 @@ ensure_sandbox() {
   run mkdir -p "$workspace"
   if ! docker container inspect "$container" >/dev/null 2>&1; then
     info "创建沙箱容器 ${container}"
-    run docker create --name "$container" \
-      --add-host host.docker.internal:host-gateway \
-      -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
-      -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
-      -v "$workspace:/home/sandbox" \
-      -p "${RESIDENT_SANDBOX_PORT:-19090}:19090" \
-      "${image}:latest"
+    if [ "$(uname -s)" = "Linux" ]; then
+      # Linux 引擎的 host.docker.internal 只是路由到 docker 网关
+      # （172.17.0.1），打不到绑在宿主回环上的 console/kernel；--network host
+      # 后沙箱内 127.0.0.1 即宿主回环（等效 docker 模式的共享网络命名空间）。
+      # macOS/Windows 走 Docker Desktop 代拨，桥接网络即可穿透宿主回环。
+      run docker create --name "$container" \
+        --network host \
+        -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
+        -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
+        -v "$workspace:/home/sandbox" \
+        "${image}:latest"
+    else
+      run docker create --name "$container" \
+        --add-host host.docker.internal:host-gateway \
+        -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= \
+        -e all_proxy= -e ALL_PROXY= -e no_proxy= -e NO_PROXY= \
+        -v "$workspace:/home/sandbox" \
+        -p "${RESIDENT_SANDBOX_PORT:-19090}:19090" \
+        "${image}:latest"
+    fi
+  elif [ "$(uname -s)" = "Linux" ] \
+       && [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$container" 2>/dev/null || true)" != "host" ]; then
+    warn "沙箱容器是旧网络模式（bridge），沙箱内无法直达宿主 kernel/console。"
+    warn "重建生效（工作区数据不受影响）：docker rm -f ${container} 后重跑本脚本"
   fi
   if [ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo false)" != "true" ]; then
     run docker start "$container"
@@ -745,18 +762,26 @@ napcat_configure() {  # 成功 0；失败 1
   chmod 600 data/workspace/.secrets/napcat_token.txt
   env_val .env RESIDENT_API_KEY > data/workspace/.secrets/core_api_key.txt
   chmod 600 data/workspace/.secrets/core_api_key.txt
-  local core_url
-  if [ "$MODE" = "docker" ]; then core_url="http://127.0.0.1:18086"; else core_url="http://host.docker.internal:18086"; fi
+  local core_url ws_url
+  if [ "$MODE" = "docker" ]; then
+    core_url="http://127.0.0.1:18086"; ws_url="ws://host.docker.internal:3001"
+  elif [ "$(uname -s)" = "Linux" ]; then
+    core_url="http://127.0.0.1:18086"; ws_url="ws://127.0.0.1:3001"
+  else
+    core_url="http://host.docker.internal:18086"; ws_url="ws://host.docker.internal:3001"
+  fi
   cat > data/workspace/.skills/qq_adapter/config/local.yaml <<EOF
 # 本机覆盖（由 scripts/install.sh 生成；通用默认见 config/default.yaml）
 napcat:
-  ws_url: ws://host.docker.internal:3001
+  ws_url: ${ws_url}
 core:
   url: ${core_url}
 EOF
   if sandbox_running; then
     info "沙箱内存活检查"
-    if docker exec -e "WS_URL=host.docker.internal:3001" -e "WS_TOKEN=${token}" \
+    local probe_ws="host.docker.internal:3001"
+    if [ "$MODE" = "host" ] && [ "$(uname -s)" = "Linux" ]; then probe_ws="127.0.0.1:3001"; fi
+    if docker exec -e "WS_URL=${probe_ws}" -e "WS_TOKEN=${token}" \
         resident-sandbox python3 /home/sandbox/.installer/ws_probe.py; then
       info "NapCat WS 存活检查通过"
       return 0
@@ -822,6 +847,7 @@ print_summary() {
   echo "            .env RESIDENT_CONSOLE_BIND（docker）"
   echo "    改图床：config/agent.yaml imgbed + .env IMGBED_API_KEY；readimage.mode"
   echo "    改邮箱：config/agent.yaml email + .env EMAIL_IMAP/SMTP_PASSWORD"
+  echo "    改人设：config/prompt/user/persona.md（自定义系统提示词，下一轮生效）"
   echo "    加技能：目录拷入 data/workspace/.skills/"
 }
 
@@ -894,6 +920,20 @@ step "工作区与技能"
 init_workspace
 seed_skill resident_dev
 seed_skill subagent
+
+# subagent notice 回推地址：macOS host 模式的沙箱是桥接容器，127.0.0.1
+# 打不到宿主 kernel，写 local.yaml 覆盖为 host.docker.internal；Linux host
+# （沙箱 --network host）与 docker 模式默认 127.0.0.1 即可，不写。
+if [ "$MODE" = "host" ] && [ "$(uname -s)" = "Darwin" ] \
+   && [ ! -f data/workspace/.skills/subagent/config/local.yaml ]; then
+  run mkdir -p data/workspace/.skills/subagent/config
+  run bash -c 'cat > data/workspace/.skills/subagent/config/local.yaml' <<'EOF'
+# 本机覆盖（由安装脚本生成；通用默认见 config/default.yaml）
+notice:
+  url: http://host.docker.internal:18086/api/notice
+EOF
+  info "已为 subagent 写入 local.yaml（host.docker.internal）"
+fi
 
 if [ "$MODE" = "docker" ]; then
   if ! docker_install; then die "安装失败：镜像构建未通过"; fi
