@@ -51,13 +51,6 @@ def _realpath_within(path: str, root: str) -> bool:
             or resolved.startswith(root_real + os.sep))
 
 
-def is_inside_workspace(path: str, host_root: str) -> bool:
-    """内核托管写入前的包含性校验（跟随符号链接）：目标真实路径必须仍在
-    工作区根内——防沙箱把托管目录/文件换成符号链接，把内核更高权限的写
-    带出工作区（.truncated / .tasks_log / .resident / memory / download 等）。"""
-    return _realpath_within(path, host_root)
-
-
 _UNIX_SAFE_OPEN = (
     hasattr(os, "O_NOFOLLOW")
     and hasattr(os, "O_DIRECTORY")
@@ -128,6 +121,8 @@ def open_file_inside(host_path: str, host_root: str, mode: str = "rb",
         if not _realpath_within(host_abs, host_root):
             logger.warning("open refused (escape): %s", host_abs)
             raise PathEscapeError(f"目标不在工作区内: {host_abs!r}")
+        if create_parents:
+            os.makedirs(os.path.dirname(host_abs), exist_ok=True)
         return open(host_abs, mode, encoding=encoding)
     flags = {
         "r": os.O_RDONLY,
@@ -161,6 +156,8 @@ def replace_text_inside(host_path: str, text: str, host_root: str,
         if not _realpath_within(host_abs, host_root):
             logger.warning("replace refused (escape): %s", host_abs)
             raise PathEscapeError(f"目标不在工作区内: {host_abs!r}")
+        if create_parents:
+            os.makedirs(os.path.dirname(host_abs), exist_ok=True)
         tmp = host_abs + ".tmp"
         Path(tmp).write_text(str(text), encoding="utf-8")
         os.replace(tmp, host_abs)
