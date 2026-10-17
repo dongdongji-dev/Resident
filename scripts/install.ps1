@@ -248,6 +248,13 @@ function Pull-ImageFallback([string]$Official, [int]$TimeoutSec = 600) {
     }
 }
 
+function Test-RegistryReachable {
+    # 6 秒探测官方镜像源（ghcr.io）；没有 curl 就假定可达（后面有超时兜底）
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $true }
+    & curl.exe -sI -m 6 'https://ghcr.io/v2/' *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $Root
 
@@ -673,16 +680,29 @@ function Install-UvPython {
 function Ensure-Sandbox {
     & docker image inspect 'resident-sandbox:latest' *> $null
     if ($LASTEXITCODE -ne 0) {
-        Info '构建沙箱镜像 resident-sandbox:latest'
-        Pull-ImageFallback 'python:3.12-slim'
-        $dockerDir = Join-Path $Root 'docker'
-        $aptMirror = Get-EnvVal '.env' 'RESIDENT_APT_MIRROR'
-        Invoke-Run 'docker build 沙箱镜像' {
-            docker build --build-arg BASE_IMAGE=python:3.12-slim `
-                --build-arg APT_MIRROR=$aptMirror `
-                --build-arg http_proxy= --build-arg https_proxy= `
-                --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= `
-                -t resident-sandbox:latest $dockerDir
+        $official = 'ghcr.io/dongdongji-dev/resident-sandbox:latest'
+        $got = $false
+        if ($script:IsDry) {
+            Write-Host "    [dry-run] 拉取官方沙箱镜像 $official（失败则本地构建）"
+            $got = $true
+        } elseif (Test-RegistryReachable) {
+            Info '拉取官方沙箱镜像（ghcr.io）'
+            $got = Pull-Timeout 600 $official -Quiet
+        }
+        if ($got) {
+            Invoke-Run '标记沙箱镜像' { docker tag $official 'resident-sandbox:latest' }
+        } else {
+            Info '构建沙箱镜像 resident-sandbox:latest'
+            Pull-ImageFallback 'python:3.12-slim'
+            $dockerDir = Join-Path $Root 'docker'
+            $aptMirror = Get-EnvVal '.env' 'RESIDENT_APT_MIRROR'
+            Invoke-Run 'docker build 沙箱镜像' {
+                docker build --build-arg BASE_IMAGE=python:3.12-slim `
+                    --build-arg APT_MIRROR=$aptMirror `
+                    --build-arg http_proxy= --build-arg https_proxy= `
+                    --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= `
+                    -t resident-sandbox:latest $dockerDir
+            }
         }
     }
     & docker container inspect 'resident-sandbox' *> $null
@@ -840,11 +860,22 @@ if ($Mode -eq 'host') {
     Invoke-HostInstall
 } else {
     Invoke-Run '写入 .env 的 RESIDENT_PYTHON' { Set-EnvVar '.env' 'RESIDENT_PYTHON' '.venv/bin/python' }
+    # 老 .env 没有镜像源键时补默认官方地址（不覆盖已有值）
+    $officialApp = 'ghcr.io/dongdongji-dev/resident-app:latest'
+    $officialSandbox = 'ghcr.io/dongdongji-dev/resident-sandbox:latest'
+    if (-not (Get-EnvVal '.env' 'RESIDENT_APP_IMAGE')) {
+        Invoke-Run '写入 .env 的镜像来源' { Set-EnvVar '.env' 'RESIDENT_APP_IMAGE' $officialApp }
+    }
+    if (-not (Get-EnvVal '.env' 'RESIDENT_SANDBOX_IMAGE')) {
+        Invoke-Run '写入 .env 的镜像来源' { Set-EnvVar '.env' 'RESIDENT_SANDBOX_IMAGE' $officialSandbox }
+    }
     Step '拉取远程镜像'
     $pulled = $false
     if ($script:IsDry) {
         Write-Host '    [dry-run] docker compose pull（失败则本地构建）'
         $pulled = $true
+    } elseif (-not (Test-RegistryReachable)) {
+        Warn '官方镜像源 ghcr.io 不可达，跳过拉取直接本地构建'
     } else {
         $log = Join-Path $env:TEMP ("resident-compose-pull-" + [guid]::NewGuid().ToString('N') + '.out')
         $p = Start-Process -FilePath 'docker' -ArgumentList @('compose', 'pull') `

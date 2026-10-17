@@ -9,7 +9,7 @@
 #   · 交互确认：需要用户操作的环节（扫码等）会暂停等待
 #
 # 部署方式（都需要 Docker；agent 命令在沙箱容器内执行）：
-#   1) docker 拉取远程镜像运行（未发布/拉取失败时自动本地构建）
+#   1) docker 优先拉取官方镜像（ghcr.io）运行，拉取不到自动本地构建
 #   2) host   宿主 Python（检查/下载 → venv → pip 安装依赖），Docker 承载沙箱与 NapCat
 #
 # 用法：
@@ -203,6 +203,15 @@ pull_image_fallback() {  # pull_image_fallback <官方名:tag> [超时秒，默�
   info "拉取镜像：${official}"
   pull_timeout "$timeout" "$official" \
     || die "拉取失败：${official}（见安装文档「代理」章节）"
+}
+
+# ── 官方镜像（推送到 main 自动构建发布到 GHCR；拉不到时自动本地构建）──
+OFFICIAL_APP_IMAGE="${RESIDENT_OFFICIAL_APP_IMAGE:-ghcr.io/dongdongji-dev/resident-app:latest}"
+OFFICIAL_SANDBOX_IMAGE="${RESIDENT_OFFICIAL_SANDBOX_IMAGE:-ghcr.io/dongdongji-dev/resident-sandbox:latest}"
+
+registry_reachable() {  # 6 秒探测官方镜像源（决定走拉取还是直接本地构建）
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sI -m 6 https://ghcr.io/v2/ >/dev/null 2>&1
 }
 
 # ── 环境检查 ─────────────────────────────────────────────────────────
@@ -436,15 +445,32 @@ ensure_sandbox() {
   local container="${RESIDENT_SANDBOX_CONTAINER:-resident-sandbox}"
   local workspace="$ROOT/data/workspace"
   if ! docker image inspect "${image}:latest" >/dev/null 2>&1; then
-    info "构建沙箱镜像 ${image}:latest"
-    pull_image_fallback python:3.12-slim
-    local apt_mirror
-    apt_mirror="$(env_val .env RESIDENT_APT_MIRROR)"
-    run docker build --build-arg BASE_IMAGE=python:3.12-slim \
-      --build-arg APT_MIRROR="$apt_mirror" \
-      --build-arg http_proxy= --build-arg https_proxy= \
-      --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
-      -t "${image}:latest" "$ROOT/docker"
+    local got_official=0
+    if [ "$DRY_RUN" = "1" ]; then
+      printf '    [dry-run] 拉取官方沙箱镜像 %s（失败则本地构建）\n' "$OFFICIAL_SANDBOX_IMAGE"
+      got_official=1
+    elif registry_reachable \
+         && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-600}" "$OFFICIAL_SANDBOX_IMAGE"; then
+      got_official=1
+      info "已拉取官方沙箱镜像"
+    fi
+    if [ "$got_official" = "1" ]; then
+      # 统一打上本地规范名（start.sh 与内核按 resident-sandbox 找）
+      run docker tag "$OFFICIAL_SANDBOX_IMAGE" "resident-sandbox:latest" 2>/dev/null || true
+      if [ "${image}:latest" != "resident-sandbox:latest" ]; then
+        run docker tag "$OFFICIAL_SANDBOX_IMAGE" "${image}:latest" 2>/dev/null || true
+      fi
+    else
+      info "构建沙箱镜像 ${image}:latest"
+      pull_image_fallback python:3.12-slim
+      local apt_mirror
+      apt_mirror="$(env_val .env RESIDENT_APT_MIRROR)"
+      run docker build --build-arg BASE_IMAGE=python:3.12-slim \
+        --build-arg APT_MIRROR="$apt_mirror" \
+        --build-arg http_proxy= --build-arg https_proxy= \
+        --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
+        -t "${image}:latest" "$ROOT/docker"
+    fi
   fi
   run mkdir -p "$workspace"
   if ! docker container inspect "$container" >/dev/null 2>&1; then
@@ -540,10 +566,17 @@ host_install() {
 # ── docker 分支安装 ──────────────────────────────────────────────────
 docker_install() {
   step "拉取远程镜像"
+  # 老 .env 没有镜像源键时补默认官方地址（不覆盖已有值）
+  [ -n "$(env_val .env RESIDENT_APP_IMAGE)" ] \
+    || run set_env_var .env RESIDENT_APP_IMAGE "$OFFICIAL_APP_IMAGE"
+  [ -n "$(env_val .env RESIDENT_SANDBOX_IMAGE)" ] \
+    || run set_env_var .env RESIDENT_SANDBOX_IMAGE "$OFFICIAL_SANDBOX_IMAGE"
   local pulled=0 pid waited=0
   if [ "$DRY_RUN" = "1" ]; then
     printf '    [dry-run] docker compose pull（失败则本地构建）\n'
     pulled=1
+  elif ! registry_reachable; then
+    warn "官方镜像源 ghcr.io 不可达，跳过拉取直接本地构建"
   else
     local log="/tmp/resident-compose-pull.$$.log"
     docker compose pull > "$log" 2>&1 &
@@ -902,7 +935,7 @@ if [ -z "$MODE" ]; then
     MODE="docker"
   else
     echo "  部署方式："
-    echo "    1) docker 拉取远程镜像运行（未发布时自动本地构建）"
+    echo "    1) docker 优先拉取官方镜像运行（拉取不到自动本地构建）"
     echo "    2) host   宿主 Python（venv + pip），Docker 承载沙箱"
     read -r -p "  选择 [1/2，默认 1]: " mode_choice || true
     case "$mode_choice" in 2|host) MODE="host" ;; *) MODE="docker" ;; esac

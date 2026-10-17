@@ -89,7 +89,11 @@ docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e npm_config_cache=/tmp
 ### 3A.3 沙箱镜像与容器
 
 ```bash
-# 镜像（大陆网络加 --build-arg APT_MIRROR=mirrors.aliyun.com）
+# 镜像：优先拉官方镜像（与仓库发布一致的干净版本）
+docker pull ghcr.io/dongdongji-dev/resident-sandbox:latest
+docker tag ghcr.io/dongdongji-dev/resident-sandbox:latest resident-sandbox:latest
+
+# 或本地构建（大陆网络加 --build-arg APT_MIRROR=mirrors.aliyun.com）
 docker build --build-arg BASE_IMAGE=python:3.12-slim -t resident-sandbox:latest docker/
 
 # 容器（工作区 data/workspace ↔ 容器 /home/sandbox）
@@ -131,8 +135,8 @@ bash scripts/start.sh    # 后台启动 + 等待端口就绪 + 打印密钥位�
 ## 3B. docker 模式（compose）
 
 ```bash
-docker compose pull           # 官方镜像未发布时会失败——正常，继续走构建
-docker compose up -d --build  # 构建并启动 resident + resident-sandbox
+docker compose pull           # 优先官方镜像；网络不可达时跳过此步
+docker compose up -d          # 启动（本地无镜像则自动构建）
 docker compose logs -f resident | head -40   # 首次登录密钥打印在启动日志
 ```
 

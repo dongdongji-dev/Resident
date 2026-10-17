@@ -82,15 +82,45 @@ function Pull-ImageFallback([string]$Official, [int]$TimeoutSec = 600) {
     if ($p.ExitCode -ne 0) { Fail "拉取失败：$Official（见安装文档「代理」章节）" }
 }
 
+function Test-RegistryReachable {
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { return $true }
+    & curl.exe -sI -m 6 'https://ghcr.io/v2/' *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Try-PullImage([string]$Image, [int]$TimeoutSec = 600) {
+    # 非致命拉取：成功 true / 失败 false（失败后调用方回退本地构建）
+    $log = Join-Path $env:TEMP ("resident-pull-" + [guid]::NewGuid().ToString('N') + '.out')
+    try {
+        $p = Start-Process -FilePath 'docker' -ArgumentList @('pull', $Image) `
+            -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+    } catch { return $false }
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        try { $p.Kill() } catch { }
+        return $false
+    }
+    return ($p.ExitCode -eq 0)
+}
+
 function Ensure-Sandbox {
     & docker image inspect 'resident-sandbox:latest' *> $null
     if ($LASTEXITCODE -ne 0) {
-        Info '构建沙箱镜像 resident-sandbox:latest'
-        Pull-ImageFallback 'python:3.12-slim'
-        $dockerDir = Join-Path $Root 'docker'
-        & docker build --build-arg BASE_IMAGE=python:3.12-slim `
-            -t resident-sandbox:latest $dockerDir
-        if ($LASTEXITCODE -ne 0) { Fail '构建沙箱镜像失败' }
+        $official = 'ghcr.io/dongdongji-dev/resident-sandbox:latest'
+        $got = $false
+        if (Test-RegistryReachable) {
+            Info '拉取官方沙箱镜像（ghcr.io）'
+            $got = Try-PullImage $official
+        }
+        if ($got) {
+            & docker tag $official 'resident-sandbox:latest'
+        } else {
+            Info '构建沙箱镜像 resident-sandbox:latest'
+            Pull-ImageFallback 'python:3.12-slim'
+            $dockerDir = Join-Path $Root 'docker'
+            & docker build --build-arg BASE_IMAGE=python:3.12-slim `
+                -t resident-sandbox:latest $dockerDir
+            if ($LASTEXITCODE -ne 0) { Fail '构建沙箱镜像失败' }
+        }
     }
     & docker container inspect 'resident-sandbox' *> $null
     if ($LASTEXITCODE -ne 0) {

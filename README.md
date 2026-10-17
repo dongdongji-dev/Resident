@@ -72,6 +72,8 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 6. **鉴权 token** —— 控制台登录密钥与内核密钥；直接回车使用随机生成值。
 7. **QQ 适配器（NapCat）** —— 是否安装；安装会拉取容器并暂停等待扫码，随后自动完成接入配置。
 
+镜像走官方源：安装器优先拉取官方镜像（`ghcr.io/dongdongji-dev`），网络不可达或拉取失败时自动改为本地构建（构建走国内源），无需手动选择。
+
 结束后脚本打印访问地址、登录密钥与常用运维命令。
 
 ### 方式二：手动安装
@@ -109,8 +111,9 @@ bash scripts/start.sh
 **docker 方式**（全部容器化）：
 
 ```bash
-cp .env.example .env    # 填模型与密钥
-docker compose up -d --build
+cp .env.example .env    # 已含官方镜像来源（ghcr.io）；填模型与密钥
+docker compose pull     # 拉官方镜像；网络不可达时跳过此步
+docker compose up -d    # 启动（本地无镜像则自动构建）
 ```
 
 安装完成后打开 <http://127.0.0.1:18082>，用 `.env` 里的 `RESIDENT_CONSOLE_TOKEN` 登录（启动日志里也会打印）。

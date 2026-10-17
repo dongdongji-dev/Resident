@@ -1,0 +1,61 @@
+name: build-images
+
+# 构建并发布官方镜像到 GHCR：ghcr.io/dongdongji-dev/resident-app:latest
+#                                  ghcr.io/dongdongji-dev/resident-sandbox:latest
+# 安装脚本默认优先拉取这两个镜像（.env.example 已指向），网络不可达时
+# 自动回退本地构建，见 scripts/install.sh / install.ps1。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'frontend/**'
+      - 'src/**'
+      - 'requirements.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/build-images.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: resident-app
+            context: .
+            file: docker/app.Dockerfile
+          - name: resident-sandbox
+            context: ./docker
+            file: docker/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

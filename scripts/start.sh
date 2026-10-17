@@ -4,7 +4,8 @@
 # 说明：
 #   - 监听地址/端口来自 config/console.yaml 的 host/port（默认 127.0.0.1:18082）；
 #     kernel 只在 127.0.0.1:<core_port>（默认 18086），经 console 代理不直接对外。
-#   - 沙箱：镜像缺失则按 docker/Dockerfile 构建，容器缺失则创建（宿主
+#   - 沙箱：镜像缺失则优先拉取官方镜像（ghcr.io），拉取不到再按
+#     docker/Dockerfile 构建；容器缺失则创建（宿主
 #     data/workspace 挂到容器 /home/sandbox），已存在则启动。
 #   - 后台运行，日志落 data/logs/console.log；PID 存 data/logs/console.pid。
 #   - 所有 /api/* 需 console.api_token：首次启动从 .env.example 生成 .env 并
@@ -62,14 +63,52 @@ if ! docker info >/dev/null 2>&1; then
 fi
 IMAGE="${RESIDENT_SANDBOX_IMAGE:-resident-sandbox}"
 CONTAINER="${RESIDENT_SANDBOX_CONTAINER:-resident-sandbox}"
+OFFICIAL_SANDBOX_IMAGE="ghcr.io/dongdongji-dev/resident-sandbox:latest"
 HOST_WORKSPACE="$ROOT/data/workspace"
+
+registry_reachable() {  # 6 秒探测官方镜像源
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sI -m 6 https://ghcr.io/v2/ >/dev/null 2>&1
+}
+
+pull_timeout() {  # pull_timeout <超时秒> <镜像>；失败非 0
+  local timeout="$1" image="$2" log pid waited=0
+  log="/tmp/resident-pull.$$.log"
+  docker pull "$image" > "$log" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$timeout" ]; then
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+}
+
 if ! docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
-  echo "沙箱镜像不存在，开始构建 $IMAGE:latest（FROM python:3.12-slim）…"
-  docker build \
-    --build-arg BASE_IMAGE=python:3.12-slim \
-    --build-arg http_proxy= --build-arg https_proxy= \
-    --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
-    -t "$IMAGE:latest" "$ROOT/docker"
+  got_official=0
+  if registry_reachable \
+     && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-600}" "$OFFICIAL_SANDBOX_IMAGE"; then
+    got_official=1
+    echo "已拉取官方沙箱镜像"
+  fi
+  if [ "$got_official" = "1" ]; then
+    # 统一打上本地规范名（内核与容器创建按 resident-sandbox 找）
+    docker tag "$OFFICIAL_SANDBOX_IMAGE" "resident-sandbox:latest" 2>/dev/null || true
+    if [ "$IMAGE:latest" != "resident-sandbox:latest" ]; then
+      docker tag "$OFFICIAL_SANDBOX_IMAGE" "$IMAGE:latest" 2>/dev/null || true
+    fi
+  else
+    echo "沙箱镜像不存在，开始构建 $IMAGE:latest（FROM python:3.12-slim）…"
+    docker build \
+      --build-arg BASE_IMAGE=python:3.12-slim \
+      --build-arg http_proxy= --build-arg https_proxy= \
+      --build-arg HTTP_PROXY= --build-arg HTTPS_PROXY= \
+      -t "$IMAGE:latest" "$ROOT/docker"
+  fi
 fi
 mkdir -p "$HOST_WORKSPACE"
 if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then

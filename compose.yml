@@ -5,8 +5,9 @@
 #   docker compose up -d --build
 #   docker compose logs -f resident   # 启动日志里有首次登录密钥
 #
-# 镜像来源：安装脚本先 docker compose pull（远程镜像），拉不到再本地构建。
-# 发布官方镜像后在 .env 设置 RESIDENT_APP_IMAGE / RESIDENT_SANDBOX_IMAGE 即可走拉取路径。
+# 镜像来源：安装脚本先 docker compose pull（.env 的 RESIDENT_APP_IMAGE /
+# RESIDENT_SANDBOX_IMAGE，默认指向官方镜像 ghcr.io/dongdongji-dev，见
+# .env.example），拉不到（网络不可达/未发布）再本地构建。
 #
 # 中国大陆网络：install 脚本探测到大陆时会自动在 .env 写入
 # RESIDENT_APT_MIRROR / RESIDENT_NPM_REGISTRY / RESIDENT_PIP_INDEX_URL，
