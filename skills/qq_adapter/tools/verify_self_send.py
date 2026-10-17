@@ -14,7 +14,11 @@
 import argparse
 
 DEFAULT_LOG = "/home/sandbox/skill_data/qq_adapter/adapter.log"
-SENT_MARKERS = ("sent group conv=", "sent private conv=", "hook action executed")
+# 只有 actions 模块在真正发出去之后才打这两行（且行内含 msg_id）。
+# ⚠️ 不要用 `submitted normal key=<id>` 或 `hook action executed` 当判据：
+#   - `submitted …` 在别人用同账号发消息（post=message_sent）时也会打；
+#   - `hook action executed` 行里没有 msg_id。
+SENT_PATTERNS = ("sent group conv=", "sent private conv=")
 
 
 def load(path):
@@ -30,7 +34,10 @@ def check(lines, msg_id, window):
     for i in hits:
         seg = lines[i:i + window]
         detail.extend(f"{i + 1}: {l}" for l in seg)
-        if any(any(m in l for m in SENT_MARKERS) for l in seg):
+        # 判据（2026-10-17 收紧）：必须【同一行里既有发送标记、又有该 msg_id】。
+        # 旧版「窗口内出现任意 sent 行即判 ours」在两端密集交错时会串行误判
+        # （实测：一端的两条被误判 ours，只因 10 行窗口里混进了另一端那条的 sent 行）。
+        if any(msg_id in l and any(p in l for p in SENT_PATTERNS) for l in seg):
             paired_at.append(i + 1)
     verdict = "ours" if paired_at else "not-ours"
     return verdict, detail, paired_at

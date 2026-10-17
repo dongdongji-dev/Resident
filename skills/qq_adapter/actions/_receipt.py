@@ -5,10 +5,13 @@
 2026-09-28 23:3x 设计约定后加；2026-10-12 从 scripts/send_msg.py 搬进 actions，
 让「走 action 发消息」也自带回执（否则我会下意识绕回老脚本，约定 23:22 点过）。
 
-判据（三情形）：
-  ① 正常：有 message_id + 逐字对账通过
+判据（四情形）：
+  ① 正常：有 message_id + **按 message_id 命中库记录**（首选）或逐字对账通过
   ② 「无 out 消息」：落库延迟，等一会儿重取
   ③ 真·静默失败：ok:true 但 message_id 为 None、库里没有 out 记录 ⇒ 没发出去，原文重发
+  ④ 同号存在另一个登录端时：库里 out 序列里混着它的消息，**只做内容比对会误报
+     「不一致」**（它在自己那条之后又发了 out，最新 out 就对不上）——故先按
+     message_id 配对；两者都不中时提示用 tools/verify_self_send.py <msg_id> 复核。
 
 对账前会抹掉适配器的两类改写（HTML 转义、`<reply/>`/`<at/>` 前缀段），
 并跳过系统类 out 记录（`[消息撤回]` / `[notice` / `[系统`）。
@@ -151,6 +154,7 @@ def verify(conv: str, text: str, response: dict | str | None,
     try:
         before = _load_seq(conv) or _bootstrap_seq(conv)
         want = text.strip()
+        want_mid = str(mid) if mid is not None else None
         outs: list = []
         for attempt in range(tries):
             msgs = _api_messages(conv, before)
@@ -158,6 +162,15 @@ def verify(conv: str, text: str, response: dict | str | None,
                 _save_seq(conv, max(int(m.get("seq", 0)) for m in msgs))
             outs = [m for m in msgs if m.get("direction") == "out"
                     and not _is_system_out(m.get("content") or "")]
+            # ① 首选：按 message_id 配对（同号另一端活跃时，内容比对会误报）
+            if want_mid:
+                for m in msgs:
+                    if (str(m.get("remote_message_id") or "") == want_mid
+                            and m.get("direction") == "out"):
+                        return line + (f"\n   ✅ 回执对账通过（按 message_id 配对）："
+                                       f"消息库 seq {m.get('seq')} / 落库 "
+                                       f"{len(norm(m.get('content') or ''))} 字")
+            # ② 回退：逐字/前缀内容比对
             for m in reversed(outs):
                 got = norm(m.get("content") or "")
                 if got == want or (want[:30] and got.startswith(want[:30])):
@@ -167,6 +180,10 @@ def verify(conv: str, text: str, response: dict | str | None,
                 time.sleep(1.5)
         last = ((outs[-1].get("content") or "")[:80].replace("\n", " / ")
                 if outs else "(无 out 消息)")
-        return line + f"\n   ⚠️ 回执不一致：消息库最新 out 内容是「{last}」"
+        hint = ""
+        if want_mid:
+            hint = (f"\n   ↳ 判据补充：用 `.skills/qq_adapter/tools/verify_self_send.py "
+                    f"{want_mid}` 复核（同号另一端活跃时内容比对会误报）")
+        return line + f"\n   ⚠️ 回执不一致：消息库最新 out 内容是「{last}」" + hint
     except Exception as exc:                              # noqa: BLE001
         return line + f"\n   ⚠️ 回执未对账（core API 不可达：{exc}）"
