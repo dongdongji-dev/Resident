@@ -450,7 +450,7 @@ ensure_sandbox() {
       printf '    [dry-run] 拉取官方沙箱镜像 %s（失败则本地构建）\n' "$OFFICIAL_SANDBOX_IMAGE"
       got_official=1
     elif registry_reachable \
-         && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-600}" "$OFFICIAL_SANDBOX_IMAGE"; then
+         && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-300}" "$OFFICIAL_SANDBOX_IMAGE"; then
       got_official=1
       info "已拉取官方沙箱镜像"
     fi

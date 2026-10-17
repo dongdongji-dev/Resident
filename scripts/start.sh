@@ -91,7 +91,7 @@ pull_timeout() {  # pull_timeout <超时秒> <镜像>；失败非 0
 if ! docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
   got_official=0
   if registry_reachable \
-     && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-600}" "$OFFICIAL_SANDBOX_IMAGE"; then
+     && pull_timeout "${RESIDENT_OFFICIAL_PULL_TIMEOUT:-300}" "$OFFICIAL_SANDBOX_IMAGE"; then
     got_official=1
     echo "已拉取官方沙箱镜像"
   fi

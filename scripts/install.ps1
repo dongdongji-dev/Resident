@@ -687,7 +687,7 @@ function Ensure-Sandbox {
             $got = $true
         } elseif (Test-RegistryReachable) {
             Info '拉取官方沙箱镜像（ghcr.io）'
-            $got = Pull-Timeout 600 $official -Quiet
+            $got = Pull-Timeout 300 $official -Quiet
         }
         if ($got) {
             Invoke-Run '标记沙箱镜像' { docker tag $official 'resident-sandbox:latest' }

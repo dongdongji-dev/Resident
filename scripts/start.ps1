@@ -88,7 +88,7 @@ function Test-RegistryReachable {
     return ($LASTEXITCODE -eq 0)
 }
 
-function Try-PullImage([string]$Image, [int]$TimeoutSec = 600) {
+function Try-PullImage([string]$Image, [int]$TimeoutSec = 300) {
     # 非致命拉取：成功 true / 失败 false（失败后调用方回退本地构建）
     $log = Join-Path $env:TEMP ("resident-pull-" + [guid]::NewGuid().ToString('N') + '.out')
     try {
