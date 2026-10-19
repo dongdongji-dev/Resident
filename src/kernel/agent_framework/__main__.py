@@ -18,6 +18,7 @@ from pathlib import Path
 
 from kernel.agent_framework.agent import Agent
 from kernel.scheduler.beat import Beat, load_beat_config
+from kernel.scheduler.focus import load_focus_config
 from kernel.agent_framework.config import (RuntimeConfig,
     load_dotenv, load_yaml)
 from kernel.agent_framework.context import ContextStore
@@ -41,6 +42,7 @@ from kernel.agent_framework.sandbox import SandboxConfig, build_executor
 from kernel.osdb.system_vars import SystemVarsStore
 from kernel.agent_framework.tools import ToolRegistry
 from kernel.agent_framework.todo_tools import make_todo_list, make_todo_update
+from kernel.agent_framework.focus_tools import make_focus_mode
 from kernel.agent_framework.notice_tools import (make_notice_create,
                                                  make_notice_delete,
                                                  make_notice_list,
@@ -120,6 +122,21 @@ def build_agent(config: dict,
     # host=系统 bash/python（后续开发内容）
     executor = None  # 执行器 = 路径解析的唯一权威（runtime_path）
     workspace_tools_cfg = load_workspace_tools_config(config)
+    # 防呆：框架工具总超时必须大于工具内部超时上限，否则工具内部超时
+    # 整理出的部分输出会被框架的 wait_for 先取消掉（结果被丢弃）。
+    if workspace_tools_cfg.enabled:
+        for cap_name, cap in (
+            ("workspace_tools.exec_max_timeout_seconds",
+             workspace_tools_cfg.exec_max_timeout_seconds),
+            ("workspace_tools.fs_timeout_seconds",
+             workspace_tools_cfg.fs_timeout_seconds),
+        ):
+            if rc.tool_timeout_seconds <= cap:
+                logger.warning(
+                    "agent.tool_timeout_seconds (%s) <= %s (%s)：工具内部"
+                    "超时（含终止前部分输出）会先被框架超时取消并丢弃；"
+                    "建议至少留 10~15 秒余量",
+                    rc.tool_timeout_seconds, cap_name, cap)
     if workspace_tools_cfg.enabled:
         executor = build_executor(
             workspace_tools_cfg.mode,
@@ -259,6 +276,10 @@ def build_agent(config: dict,
                                          else "")))
     registry.register("notice_delete", make_notice_delete(notices))
     registry.register("notice_list_cron", make_notice_list_cron(notices))
+    # 专注模式工具（期间抑制消息唤醒，beat 定时汇报未读统计）
+    focus_cfg = load_focus_config(config)
+    registry.register("focus_mode",
+                      make_focus_mode(system_vars, focus_cfg, messages))
     # 消息工具（agent 自主查询/筛选消息）
     mt_cfg = dict(rc.messages_tools)
     mt_cfg["unread_window_hours"] = rc.unread_window_hours
@@ -316,7 +337,8 @@ def build_agent(config: dict,
                            todos=todos,
                            truncated_dir=(workspace_tools_cfg.truncated_dir
                                           if workspace_tools_cfg.enabled
-                                          else ""))
+                                          else ""),
+                           focus=focus_cfg)
         logger.info("beat enabled (interval=%ss)", beat_cfg.interval_seconds)
     agent._db = db  # held for lifetime; closed on shutdown
     return agent
@@ -365,6 +387,7 @@ def main() -> int:
             api_key=rc.http_api_key,
             messages=getattr(agent, "_messages", None),
             notices=getattr(agent, "_notices", None),
+            system_vars=getattr(agent, "system_vars", None),
             max_body_bytes=rc.http_max_body_bytes,
             skills=skills_http,
             shutdown_timeout=rc.http_shutdown_timeout_seconds)

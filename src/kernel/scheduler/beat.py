@@ -56,12 +56,18 @@ from typing import Any, Optional
 from kernel.agent_framework.content import text_of
 from kernel.agent_framework.logging_setup import get_logger
 from kernel.agent_framework.paths import open_file_inside
-from kernel.agent_framework.timeutil import now_str
+from kernel.agent_framework.timeutil import fmt, now_str, parse
 from kernel.osdb.messages import MessagesStore
 from kernel.osdb.notice import NoticeStore
+from kernel.scheduler.focus import (KEY_RESUME, KEY_STARTED,
+                                    FocusConfig, bump_reminder,
+                                    cancel as cancel_focus,
+                                    filter_context, focus_until,
+                                    reminder_due, reminder_text)
 
 # 运行时消息标识（与 runtime_block 注入说明共用，改这里即两处同步）
 URGENT_PREFIX = "（有人找你）"
+FOCUS_BLOCK_MARKER = "【专注筛选】"
 NOTICE_ENVELOPE = "[通知 #{notice_id} {time}]"
 TAIL_LINE_TEMPLATE = ("已展示 {displayed} 条，实际本会话在这个时间段还存在 "
                       "{remaining} 条未读未展示消息，请及时处理")
@@ -175,7 +181,8 @@ class Beat:
                  notices: NoticeStore, system_vars: SystemVarsStore,
                  config: BeatConfig,
                  todos: Optional[TodoStore] = None,
-                 truncated_dir: str = "") -> None:
+                 truncated_dir: str = "",
+                 focus: Optional[FocusConfig] = None) -> None:
         self._agent = agent
         self._messages = messages
         self._notices = notices
@@ -183,6 +190,7 @@ class Beat:
         self._config = config
         self._todos = todos  # Optional[TodoStore]：主动唤醒附带 todo 树
         self._truncated_dir = truncated_dir  # 唤醒截断内容落盘目录
+        self._focus_cfg = focus or FocusConfig()  # 专注模式（120/3 默认）
         # 外部组件（事件端口）投递事件的入口；kind 未定义，仅 info
         self._event_queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._task: Optional[asyncio.Task[Any]] = None
@@ -223,8 +231,18 @@ class Beat:
     # ── the tick ───────────────────────────────────────────────────────
 
     def _tick(self) -> None:
-        # 1) 唤醒决策（urgent 无条件 / 概率命中）——写 notice
-        self._maybe_awake()
+        # 1) 唤醒决策；专注模式按类型处理：
+        #    all 全屏蔽 / filter 白黑名单（仅过筛消息可唤醒）
+        focus_state, focus_flt = self._focus_step()
+        if focus_state == "all":
+            pass
+        elif focus_state == "filter":
+            self._maybe_awake(focus_filter=focus_flt)
+        elif focus_state == "expired":
+            # 专注刚结束：强制唤醒一次，把积压立即推给 agent
+            self._wake_after_focus()
+        else:
+            self._maybe_awake()
         # 2) 定时任务（归档）
         self._run_scheduled()
         # 3) 事件队列 drain（kind 未定义，仅 info）
@@ -265,6 +283,145 @@ class Beat:
                         str(event.get("payload", ""))[:200])
         if drained:
             logger.info("beat drained %d events this tick", drained)
+
+    # ── focus mode ─────────────────────────────────────────────────────
+
+    def _focus_step(self) -> tuple[str, Optional[dict[str, Any]]]:
+        """专注模式状态机（每 tick 一次），返回 ``(state, filter)``：
+
+        - ``"off"``     未开启；
+        - ``"all"``     全屏蔽：抑制一切消息唤醒，按间隔发提醒；
+        - ``"filter"``  白/黑名单筛选：仅过筛会话可唤醒，被筛除的
+          消息只以条数浓缩展示，无周期提醒；
+        - ``"expired"`` 刚到期或被主动解除：清状态，由调用方强制
+          唤醒一次带回积压。
+        """
+        until = focus_until(self._system_vars)
+        if until is None:
+            if self._system_vars.get(KEY_RESUME):
+                # 主动解除（工具/控制台）：下一 tick 强制带回积压
+                self._system_vars.clear(KEY_RESUME)
+                logger.info("focus released, flushing backlog")
+                return "expired", None
+            return "off", None
+        now = datetime.now()
+        if now >= until:
+            cancel_focus(self._system_vars)
+            logger.info("focus expired")
+            return "expired", None
+        flt = filter_context(self._system_vars)
+        if flt is not None:
+            return "filter", flt
+        if reminder_due(self._system_vars, now):
+            self._focus_reminder(now, until)
+            bump_reminder(self._system_vars, self._focus_cfg, now)
+        return "all", None
+
+    def _focus_reminder(self, now: datetime, until: datetime) -> None:
+        """写一条专注模式提醒 notice（只带未读统计，不带消息内容）。"""
+        pending = self._messages.pending(
+            window_hours=self._config.unread_window_hours,
+            max_per_session=self._config.unread_max_per_session)
+        counts: dict[str, int] = {}
+        for message in pending:
+            session = _session_of(message)
+            counts[session] = counts.get(session, 0) + 1
+        started_at = self._system_vars.get(KEY_STARTED)
+        started = parse(started_at) if started_at else None
+        content = reminder_text(
+            now_label=fmt(now), until_label=fmt(until),
+            remaining_minutes=max(
+                0, int((until - now).total_seconds() // 60)),
+            started_at=started, total=len(pending), sessions=counts,
+            cfg=self._focus_cfg)
+        self._notices.create(content=content, kind="once",
+                             due_at=now_str())
+        logger.info("focus reminder sent unread=%d sessions=%d",
+                    len(pending), len(counts))
+
+    def _wake_after_focus(self) -> None:
+        """专注到期后的强制唤醒：积压全部交给标准唤醒载荷（含紧急）。"""
+        pending_all = self._messages.pending()
+        if not pending_all:
+            return
+        urgent = [m for m in pending_all if m["wakeup"]]
+        self._fire_wake(pending_all, urgent_messages=urgent)
+
+    def _session_passes_filter(self, message: dict[str, Any],
+                               focus_filter: dict[str, Any]) -> bool:
+        session = _session_of(message)
+        if focus_filter["mode"] == "whitelist":
+            return session in focus_filter["sessions"]
+        return session not in focus_filter["sessions"]
+
+    def _partition_by_filter(
+            self, messages: list[dict[str, Any]],
+            focus_filter: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        passing: list[dict[str, Any]] = []
+        muted: list[dict[str, Any]] = []
+        for message in messages:
+            target = (passing
+                      if self._session_passes_filter(message,
+                                                     focus_filter)
+                      else muted)
+            target.append(message)
+        return passing, muted
+
+    def _focus_block(self, focus_filter: dict[str, Any],
+                     muted: list[dict[str, Any]]) -> str:
+        """筛选模式随醒信息块：名单内容 + 被筛除未读计数（不展开
+        内容）+ 到期时间。"""
+        until = focus_until(self._system_vars)
+        until_label = fmt(until) if until is not None else ""
+        listed = "、".join(sorted(focus_filter["sessions"])) or "（空）"
+        if focus_filter["mode"] == "whitelist":
+            head = ("当前处于专注筛选模式（白名单）："
+                    f"仅以下会话实时推送——{listed}")
+        else:
+            head = ("当前处于专注筛选模式（黑名单）："
+                    f"以下会话暂不推送内容——{listed}")
+        counts: dict[str, int] = {}
+        for message in muted:
+            session = _session_of(message)
+            counts[session] = counts.get(session, 0) + 1
+        if counts:
+            detail = "；".join(
+                f"{session} {count} 条" for session, count in
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            hidden = (f"；被筛除消息共 {len(muted)} 条未读"
+                      f"（{detail}），仅计数、不展开内容")
+        else:
+            hidden = "；当前没有被筛除的未读消息"
+        tail = (f"；筛选到期时间 {until_label}，到期后自动恢复正常推送"
+                if until_label else "")
+        return f"{FOCUS_BLOCK_MARKER}{head}{hidden}{tail}。"
+
+    def _focus_block_queued(self) -> bool:
+        """True when the agent event queue already holds a notice carrying
+        the focus filter block — later notices in the SAME batch (the
+        supplement channel) must not repeat it, same spirit as the
+        supplement channel for messages. Once the batch is consumed, a new
+        wake carries the block again (with fresh counts / expiry)."""
+        events = getattr(self._agent, "events", None)
+        if events is None:
+            return False
+        try:
+            snapshot = (events.snapshot()
+                        if callable(getattr(events, "snapshot", None))
+                        else list(events))
+        except Exception:  # noqa: BLE001 — 检测失败按「没有」处理
+            return False
+        for event in snapshot:
+            if isinstance(event, dict):
+                content = event.get("content", "")
+            else:
+                content = getattr(event, "content", "")
+            if not isinstance(content, str):
+                content = text_of(content)
+            if FOCUS_BLOCK_MARKER in (content or ""):
+                return True
+        return False
 
     # ── wake decision ──────────────────────────────────────────────────
 
@@ -312,8 +469,11 @@ class Beat:
             keys.update(re.findall(r'conversation_key="([^"]+)"', content or ""))
         return {_session_of_key(key) for key in keys}, keys
 
-    def _maybe_awake(self) -> None:
-        """Wake-decision chain:
+    def _maybe_awake(self,
+                     focus_filter: Optional[dict[str, Any]] = None) -> None:
+        """Wake-decision chain (``focus_filter`` narrows the eligible
+        messages to whitelisted / non-blacklisted sessions; everything
+        else is condensed to unread counts):
 
         1. urgent wake: unread messages marked wakeup=1 exist → fire
            immediately WITHOUT probability check;
@@ -323,15 +483,24 @@ class Beat:
            (``p * e^(unread_weight * unread)`` capped 1.0) → general wake.
         """
         pending_all = self._messages.pending()
+        muted_all: list[dict[str, Any]] = []
+        if focus_filter is not None:
+            pending_all, muted_all = self._partition_by_filter(
+                pending_all, focus_filter)
         urgent = [m for m in pending_all if m["wakeup"]]
         if urgent:
             # 紧急消息不受窗口限制（必须及时处理）；会话上限仍适用
-            self._fire_wake(pending_all, urgent_messages=urgent)
+            self._fire_wake(pending_all, urgent_messages=urgent,
+                            focus_filter=focus_filter, muted=muted_all)
             return
         # 普通唤醒：窗口外/超上限的未读视为已读（不携带不统计）
         pending = self._messages.pending(
             window_hours=self._config.unread_window_hours,
             max_per_session=self._config.unread_max_per_session)
+        muted: list[dict[str, Any]] = []
+        if focus_filter is not None:
+            pending, muted = self._partition_by_filter(pending,
+                                                       focus_filter)
         if (self._config.wake_dedup
                 and self._config.wake_cooldown_seconds > 0):
             if time.time() - self._last_wake_at \
@@ -348,10 +517,13 @@ class Beat:
             return
         logger.info("proactive awake hit p=%.6f unread=%d effective=%.6f",
                     base, len(pending), effective)
-        self._fire_wake(pending, urgent_messages=[])
+        self._fire_wake(pending, urgent_messages=[],
+                        focus_filter=focus_filter, muted=muted)
 
     def _fire_wake(self, pending: list[dict[str, Any]],
-                   urgent_messages: list[dict[str, Any]]) -> None:
+                   urgent_messages: list[dict[str, Any]],
+                   focus_filter: Optional[dict[str, Any]] = None,
+                   muted: Optional[list[dict[str, Any]]] = None) -> None:
         """Assemble the wake payload and write it as a notice (the single
         channel to the Agent). Carried messages are marked read; urgent
         messages are demoted (wakeup=0) after display; the probability is
@@ -365,6 +537,10 @@ class Beat:
         content, supplement, carried_keys, demote_keys = \
             self._build_wake_payload(pending, urgent_messages,
                                      queued_sessions, queued_keys)
+        # 筛选块只在队列中没有副本时附带：同一批内的补充通知不重复写
+        focus_block = ""
+        if focus_filter is not None and not self._focus_block_queued():
+            focus_block = self._focus_block(focus_filter, muted or [])
         todo_block = self._todo_block(urgent_messages)
         now = now_str()
         # 唤醒冷却：概率降到下限；记录唤醒时间（dedup 门闩）
@@ -388,11 +564,13 @@ class Beat:
             # 概率命中但无未读（或未读均已在队列）：无新消息提示词。
             # 真正的自由活动窗口（完全没有 pending）才附带会话最新预览；
             # 未读均已排队时不预览，避免与队列内容重复
-            preview = self._free_window_preview() if not pending else ""
+            preview = (self._free_window_preview(focus_filter)
+                       if not pending else "")
             self._notices.create(
                 content=(f"当前时间：{now}\n\n"
                          f"{self._load_no_message_prompt()}{todo_block}"
-                         f"{preview}"),
+                         f"{preview}"
+                         + (f"\n\n{focus_block}" if focus_block else "")),
                 kind="once", due_at=now)
             logger.info("wake fired (no new messages, preview=%s)",
                         bool(preview))
@@ -403,14 +581,16 @@ class Beat:
                          f"{self._config.wake_notice_prefix}\n\n"
                          f"{content}{todo_block}\n\n"
                          "请注意不要仅凭消息预览就判定群内消息一定与你无关\n"
-                         "请自主选择查看未读消息或保持沉默或自主行动"),
+                         "请自主选择查看未读消息或保持沉默或自主行动"
+                         + (f"\n\n{focus_block}" if focus_block else "")),
                 kind="once", due_at=now)
         if supplement is not None:
             # 补充通知：不重复完整开头/结尾；todo 树只在纯补充时附带
             self._notices.create(
                 content=(f"{self._config.wake_supplement_prefix}\n\n"
                          f"{supplement}"
-                         f"{todo_block if content is None else ''}"),
+                         f"{todo_block if content is None else ''}"
+                         + (f"\n\n{focus_block}" if focus_block else "")),
                 kind="once", due_at=now)
         if carried_keys:
             self._messages.mark_sent_to_llm(carried_keys)
@@ -441,7 +621,9 @@ class Beat:
             logger.exception("todo tree build failed")
             return ""
 
-    def _free_window_preview(self) -> str:
+    def _free_window_preview(
+            self,
+            focus_filter: Optional[dict[str, Any]] = None) -> str:
         """自由活动窗口的消息预览：各会话最新一条（无条件——任何方向/
         已读状态，自己发送的 out 消息也计入），取最新活跃的前 x 个会话。
         只读查询：不改变已读状态（预览不等于消费）。"""
@@ -455,6 +637,9 @@ class Beat:
         except Exception:  # noqa: BLE001 — 预览失败不影响唤醒
             logger.exception("free window preview query failed")
             return ""
+        if focus_filter is not None:
+            rows = [row for row in rows
+                    if self._session_passes_filter(row, focus_filter)]
         if not rows:
             return ""
         lines = [PREVIEW_HEADER]

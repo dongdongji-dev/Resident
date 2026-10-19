@@ -25,6 +25,9 @@ Endpoints (single port; services are separated by path):
   ``GET  /api/notice``  列出（?include_done=1）
   ``GET  /api/notice/{id}`` 单查
   ``DELETE /api/notice/{id}`` 删除
+- 专注模式域（需配置 system_vars）：
+  ``GET  /api/focus`` 查询专注模式状态
+  ``POST /api/focus/release`` 手动解除专注模式
 - ``GET  /``              minimal chat frontend
 """
 
@@ -46,6 +49,11 @@ from kernel.agent_framework.skills import (delete_skill, install_skill_zip,
                                            list_skills, skill_detail)
 from kernel.osdb.messages import MessagesStore
 from kernel.osdb.notice import NoticeStore
+from kernel.osdb.system_vars import SystemVarsStore
+from kernel.scheduler.focus import cancel as cancel_focus
+from kernel.scheduler.focus import is_active as focus_is_active
+from kernel.scheduler.focus import request_flush as focus_request_flush
+from kernel.scheduler.focus import status as focus_status
 from kernel.http_interface.eventbus import StreamBus
 
 logger = get_logger("kernel.http_interface.server")
@@ -71,6 +79,7 @@ def build_app(agent: Agent, bus: StreamBus,
               api_key: str | None = None,
               messages: Optional[MessagesStore] = None,
               notices: Optional[NoticeStore] = None,
+              system_vars: Optional[SystemVarsStore] = None,
               max_body_bytes: Optional[int] = None,
               skills: Optional[dict[str, Any]] = None) -> web.Application:
     """Build the kernel HTTP app. When ``api_key`` is set, every ``/api/*``
@@ -330,6 +339,24 @@ def build_app(agent: Agent, bus: StreamBus,
             return web.json_response({"error": "notice not found"}, status=404)
         return web.json_response({"ok": True})
 
+    # ── 专注模式域 ─────────────────────────────────────────────────────
+
+    async def focus_get(request: web.Request) -> web.Response:
+        if system_vars is None:
+            return web.json_response(
+                {"error": "system vars not configured"}, status=503)
+        return web.json_response(focus_status(system_vars))
+
+    async def focus_release(request: web.Request) -> web.Response:
+        if system_vars is None:
+            return web.json_response(
+                {"error": "system vars not configured"}, status=503)
+        was_active = focus_is_active(system_vars)
+        cancel_focus(system_vars)
+        if was_active:
+            focus_request_flush(system_vars)  # beat 下一 tick 带回积压
+        return web.json_response({"ok": True, "active": False})
+
     # ── 技能域（管理界面）：列表 / 详情 / zip 安装 / 回收删除 ──────────
     # 名称优先取 SKILL.md front matter 的 name；覆盖前备份到 backup_dir，
     # 删除移入 trash_dir（都在 data/ 下，不进 agent 工作区）。
@@ -439,6 +466,8 @@ def build_app(agent: Agent, bus: StreamBus,
     app.router.add_get("/api/notice", notice_list)
     app.router.add_get("/api/notice/{id}", notice_get)
     app.router.add_delete("/api/notice/{id}", notice_delete)
+    app.router.add_get("/api/focus", focus_get)
+    app.router.add_post("/api/focus/release", focus_release)
     app.router.add_get("/api/skills", skills_list)
     app.router.add_get("/api/skills/detail", skills_detail)
     app.router.add_post("/api/skills/install", skills_install)
@@ -458,6 +487,7 @@ async def start_server(agent: Agent, bus: StreamBus,
                        api_key: str | None = None,
                        messages: Optional[MessagesStore] = None,
                        notices: Optional[NoticeStore] = None,
+                       system_vars: Optional[SystemVarsStore] = None,
                        max_body_bytes: Optional[int] = None,
                        skills: Optional[dict[str, Any]] = None,
                        shutdown_timeout: float = 5.0
@@ -465,6 +495,7 @@ async def start_server(agent: Agent, bus: StreamBus,
     """Start the aiohttp server inside the running event loop."""
     app = build_app(agent, bus, api_key=api_key,
                     messages=messages, notices=notices,
+                    system_vars=system_vars,
                     max_body_bytes=max_body_bytes, skills=skills)
     runner = web.AppRunner(app, shutdown_timeout=shutdown_timeout)
     await runner.setup()

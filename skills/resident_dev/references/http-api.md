@@ -45,6 +45,14 @@
 | POST | `/api/notice` | 创建通知。body：`{content, kind?("once"\|"cron"), due_at?, delay_seconds?, cron?, notification?}` → `{id}`，到期由 beat 推送 |
 | GET | `/api/notice?include_done=1` / `GET /api/notice/{id}` / `DELETE /api/notice/{id}` | 通知管理 |
 
+### 专注模式域（focus）
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/focus` | 查询专注状态：`{active, mode("all"\|"whitelist"\|"blacklist"), sessions[], until, remaining_minutes}` |
+| POST | `/api/focus/release` | 手动解除专注模式（等价 `focus_mode` 传 0）；积压消息下一 tick 恢复推送 |
+
+> 专注模式由 agent 的 `focus_mode` 工具开启：`all` 全屏蔽（期间只推未读统计提醒）；`whitelist`/`blacklist` 为会话筛选，仅过筛消息可唤醒，被筛除消息只以未读条数浓缩展示、无周期提醒。上限与提醒间隔见 `config/agent.yaml` 的 `focus` 段。
+
 ### 事件注入
 | 方法 | 路径 | 说明 |
 |---|---|---|

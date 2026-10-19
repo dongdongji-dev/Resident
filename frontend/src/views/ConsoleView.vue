@@ -4,11 +4,14 @@
       <h2>Core 控制台</h2>
       <n-tag size="small" :type="status.running ? 'success' : 'error'" round>
         {{ status.running ? '运行中' : '已停止' }}</n-tag>
+      <n-tag v-if="focus.active" size="small" type="warning" round>
+        {{ focusLabel }}</n-tag>
       <span class="meta">{{ meta }}</span>
       <div class="actions">
         <n-button size="small" type="success" :disabled="status.running || busy" :loading="busyAction === 'start'" @click="control('start')">启动</n-button>
         <n-button size="small" type="error" :disabled="!status.running || busy" :loading="busyAction === 'stop'" @click="control('stop')">停止</n-button>
         <n-button size="small" type="info" :disabled="!status.running || busy" :loading="busyAction === 'restart'" @click="control('restart')">重启</n-button>
+        <n-button v-if="focus.active" size="small" type="warning" :loading="focusBusy" @click="releaseFocus">解除专注</n-button>
       </div>
     </header>
 
@@ -42,6 +45,13 @@ import { consoleApi } from "../api";
 const status = ref({ running: false, pid: null, started_at: null, uptime: null, log_file: "", core_port: 18086 });
 const busy = ref(false);
 const busyAction = ref("");
+const focus = ref({ active: false, remaining_minutes: 0, until: null });
+const focusBusy = ref(false);
+const focusLabel = computed(() => {
+  const suffix = focus.value.mode === "whitelist" ? "（白名单）"
+    : focus.value.mode === "blacklist" ? "（黑名单）" : "";
+  return `专注中${suffix} · 剩余 ${focus.value.remaining_minutes} 分钟`;
+});
 const fLevel = ref("INFO");
 const fQuery = ref("");
 const fLogger = ref("");
@@ -65,6 +75,19 @@ async function pollStatus() {
   try {
     status.value = await (await consoleApi("/api/status")).json();
   } catch { status.value.running = false; }
+}
+async function pollFocus() {
+  try {
+    const data = await (await consoleApi("/api/focus")).json();
+    if (!data.error) focus.value = data;
+  } catch { focus.value.active = false; }
+}
+async function releaseFocus() {
+  focusBusy.value = true;
+  try {
+    await consoleApi("/api/focus/release", { method: "POST" });
+    await pollFocus();
+  } finally { focusBusy.value = false; }
 }
 async function fetchLogs() {
   const q = `after=${offset}&level=${encodeURIComponent(fLevel.value)}` +
@@ -95,7 +118,9 @@ async function control(action) {
 
 onMounted(() => {
   pollStatus();
+  pollFocus();
   fetchLogs();
+  setInterval(pollFocus, 3000);
   setInterval(pollStatus, 3000);
   setInterval(fetchLogs, 1000);
 });

@@ -12,6 +12,8 @@
       <span class="badge">第 {{ chat.round }} 轮</span>
       <span v-if="chat.queue.length" class="badge warn">队列 {{ chat.queue.length }}</span>
       <span class="badge" :class="{ ok: chat.connected }">流 {{ chat.connected ? '已连接' : '重连中' }}</span>
+      <n-tag v-if="focus.active" size="small" type="warning" round>{{ focusLabel }}</n-tag>
+      <n-button v-if="focus.active" size="small" type="warning" :loading="focusBusy" @click="releaseFocus">解除专注</n-button>
     </header>
 
     <div class="messages" ref="scroller">
@@ -698,6 +700,28 @@ async function loadHistory({ silent = false } = {}) {
   }
 }
 
+// ── 专注模式：状态显示 + 一键解除（解除后积压立即回补）──
+const focus = ref({ active: false, remaining_minutes: 0, mode: null });
+const focusBusy = ref(false);
+const focusLabel = computed(() => {
+  const suffix = focus.value.mode === "whitelist" ? "（白名单）"
+    : focus.value.mode === "blacklist" ? "（黑名单）" : "";
+  return `专注中${suffix} · 剩余 ${focus.value.remaining_minutes} 分钟`;
+});
+async function pollFocus() {
+  try {
+    const data = await (await consoleApi("/api/focus")).json();
+    if (!data.error) focus.value = data;
+  } catch { focus.value.active = false; }
+}
+async function releaseFocus() {
+  focusBusy.value = true;
+  try {
+    await consoleApi("/api/focus/release", { method: "POST" });
+    await pollFocus();
+  } finally { focusBusy.value = false; }
+}
+
 // ── SSE 断流兜底：HTTP 轮询同步（队列移除/新消息展示不依赖 SSE）──
 let lastSynced = "";
 async function refreshState() {
@@ -762,6 +786,9 @@ onMounted(async () => {
   setInterval(() => {
     if (!chat.connected) syncFromContext();
   }, 3000);
+  // 专注模式状态轮询（头部显示 + 解除按钮）
+  pollFocus();
+  setInterval(pollFocus, 3000);
 });
 onBeforeUnmount(() => {
   if (es) es.close();
