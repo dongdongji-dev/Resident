@@ -13,8 +13,8 @@
       blue    蓝表头白字＋白/浅蓝交替行＋数据间细黑线；
       green   绿表头白字＋偶数行浅绿＋数据间细黑线。
   · 字体只有两种：中文仿宋_GB2312 ＋ 拉丁 Times New Roman，文件在本 action 的 `fonts/`，
-    按文件名引用，缺文件直接报错（不做缺字体兜底）。
-  · 画布固定 8.6 英寸 @150dpi，图宽不随内容变；列宽按字形实测（TextPath）分配，不靠字符数估。
+    按文件名引用；字体文件因版权不进版本库，缺文件时打 warning 并回退系统字体（不抛异常）。
+  · 画布固定 12 英寸 @150dpi（1800px），图宽不随内容变；列宽按字形实测（TextPath）分配，不靠字符数估。
   · 排布顺序：① 调列宽让每格单行 → ② 无解逐档缩字号（13→9pt，9pt 是仿宋可渲染下限）
     → ③ 表头折两行再试 → ④ 仍无解不折行直接输出。列间距硬性下限按列数分摊画布（48–90px）。
   · 默认整列居中；分隔行 :--- 左对齐、---: 右对齐。
@@ -41,8 +41,8 @@ from matplotlib.textpath import TextPath  # noqa: E402
 from matplotlib import patheffects as pe  # noqa: E402
 
 # 字体：**只用两种**——拉丁＝Times New Roman，
-# 中文＝仿宋_GB2312。字体文件随 action 走，放在本目录 `fonts/` 下，由这里按文件名引用；
-# 文件在就不报错，**不做缺字体兜底**（缺了直接抛，让问题看得见）。
+# 中文＝仿宋_GB2312。字体文件放在本目录 `fonts/` 下按文件名引用；因版权**不进版本库**
+# （分发版默认不带），缺文件时打 warning 并回退系统字体，不抛异常。
 HERE = Path(__file__).resolve().parent
 FONT_DIR = HERE / "fonts"
 LATIN_KEYS = ("times", "timesnewroman", "newroman")
@@ -88,10 +88,27 @@ DEFAULT_STYLE = "three"
 NUM_RE = re.compile(r"^[0-9\s.,~\-–%×x*/]+(元|块|GB|TB|W|核|槽|人|条|页|起|万)?")
 
 
-def setup_font() -> None:
-    """引用 action 自带字体：拉丁 Times New Roman ＋ 中文仿宋_GB2312。
+CJK_FALLBACKS = ("Noto Sans CJK SC", "Noto Serif CJK SC", "WenQuanYi Zen Hei",
+                 "WenQuanYi Micro Hei", "AR PL UMing CN", "AR PL UKai CN",
+                 "Droid Sans Fallback", "SimHei", "Microsoft YaHei")
+LATIN_FALLBACKS = ("Liberation Serif", "DejaVu Serif", "Times New Roman", "DejaVu Sans")
 
-    缺文件直接抛 FileNotFoundError——不做系统字体兜底（两个字体放齐即可）。
+
+def _sys_font(names: tuple) -> str | None:
+    """在系统已注册字体里按优先级挑一个，返回字体名（都没有则 None）。"""
+    have = {f.name for f in font_manager.fontManager.ttflist}
+    for n in names:
+        if n in have:
+            return n
+    return None
+
+
+def setup_font() -> None:
+    """引用字体：拉丁 Times New Roman ＋ 中文仿宋_GB2312（`fonts/` 里有文件时优先用）。
+
+    字体文件因版权不进版本库，分发版默认不带——
+    缺文件时**打 warning 并回退系统字体**（中文按 CJK_FALLBACKS 优先级挑，
+    拉丁按 LATIN_FALLBACKS），不抛异常，渲染照常出图。
     """
     files = [f for f in sorted(FONT_DIR.iterdir())
              if f.suffix.lower() in (".ttf", ".otf", ".ttc")] if FONT_DIR.is_dir() else []
@@ -102,25 +119,51 @@ def setup_font() -> None:
             cjk = f
         elif any(k in n for k in LATIN_KEYS):
             latin = f
-    if not cjk or not latin:
-        raise FileNotFoundError(
-            f"fonts/ 里缺字体：需要 Times New Roman 与仿宋_GB2312 各一个，现有 {[f.name for f in files]}")
-    for f in (latin, cjk):
-        font_manager.fontManager.addfont(str(f))
-    chain = [font_manager.FontProperties(fname=str(latin)).get_name(),
-             font_manager.FontProperties(fname=str(cjk)).get_name()]
-    plt.rcParams["font.family"] = chain
-    plt.rcParams["font.sans-serif"] = chain
-    plt.rcParams["font.serif"] = chain
-    plt.rcParams["axes.unicode_minus"] = False
-    global FONT_USED
-    FONT_USED = "+".join(chain)
-    global _LATIN, _CJK
+    global _LATIN, _CJK, _LATIN_NAME, _CJK_NAME, FONT_USED
     _LATIN, _CJK = latin, cjk
+    _LATIN_NAME = _CJK_NAME = None
+    chain: list[str] = []
+    for kind, path, fb, is_cjk in (("拉丁 Times New Roman", latin, LATIN_FALLBACKS, False),
+                                   ("中文 仿宋_GB2312", cjk, CJK_FALLBACKS, True)):
+        if path is not None:
+            font_manager.fontManager.addfont(str(path))
+            name = font_manager.FontProperties(fname=str(path)).get_name()
+        else:
+            name = _sys_font(fb)
+            print(f"[table_render] warning: 缺 {kind} 字体文件，回退系统字体 "
+                  f"{name or '（系统也没有，用 matplotlib 默认）'}", file=sys.stderr)
+            if name:
+                if is_cjk:
+                    _CJK_NAME = name
+                else:
+                    _LATIN_NAME = name
+        if name:
+            chain.append(name)
+    if chain:
+        plt.rcParams["font.family"] = chain
+        plt.rcParams["font.sans-serif"] = chain
+        plt.rcParams["font.serif"] = chain
+    plt.rcParams["axes.unicode_minus"] = False
+    FONT_USED = "+".join(chain) or "matplotlib-default"
 
 
 _LATIN = None
 _CJK = None
+_LATIN_NAME = None
+_CJK_NAME = None
+
+
+def _fp(cjk: bool, weight: str = "normal") -> FontProperties:
+    """取 FontProperties：有自带字体文件走 fname，回退时走 family 名。"""
+    p = _CJK if cjk else _LATIN
+    if p is not None:
+        return FontProperties(fname=str(p), weight=weight)
+    nm = _CJK_NAME if cjk else _LATIN_NAME
+    if nm:
+        return FontProperties(family=[nm], weight=weight)
+    return FontProperties(weight=weight)
+
+
 _MEASURE_CACHE: dict = {}
 
 
@@ -179,8 +222,7 @@ def measure(s: str, fs: float, bold: bool = False) -> float:
         if not chunk.strip():                    # 纯空格：TextPath 会给出空路径
             total += len(chunk) * fs * 0.30
             continue
-        fp = FontProperties(fname=str(_CJK if cjk else _LATIN),
-                            weight="bold" if bold else "normal")
+        fp = _fp(cjk, weight="bold" if bold else "normal")
         try:
             total += TextPath((0, 0), chunk, size=fs, prop=fp).get_extents().width
         except Exception:                        # 字形取不到时退回按字符数估
