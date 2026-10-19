@@ -109,6 +109,8 @@ python3 send_flow/send_flow.py private_1000000002 note.md --only-plan / --dry-ru
 ```
 
 - md：一行＝一条消息（过长按句子边界再切）；`![说明](绝对路径)`＝图片、`[文件](绝对路径)`＝文件、markdown 表格自动渲染成 PNG 发出。
+- 表格风格：`<table style="…">` 或 CLI `--table-style`，五选一——`three`（默认，论文三线表）· `compact`（列多时用，字号紧一档）· `dark` · `blue` · `green`；单元格内 `**…**` 局部加粗（整行加粗＝合计行，自动补分隔线），支持多行表头跨列/跨行合并。
+- 表格渲染字体：中文仿宋_GB2312 ＋ 拉丁 Times New Roman，放到 `actions/send_flow/fonts/`（文件名含 `times`/`仿宋` 即被识别）；字体不随仓库分发，缺失会明确报错（见该目录 README）。
 - xml（`--format xml`，后缀 `.xml` 自动识别）：`<text>` `<table>` `<image>` `<file>` `<poke>` 五个标签；`split="true"` 开＝该块按换行拆条，`separate="true"` 开＝块内图片/表格单独成条。
 - 核对：文本走回执对账；图片/文件/混排走 `get_msg` 核 msgid；**拿不到 msgid 不重发**——按 `--msgid-timeout` 去消息库核（核到补 msgid，核不到判丢包）。
 - 常用选项：`--delay 1.5`、`--max-chars 160`、`--rows-per-img 6`、`--no-trim`、`--force`、`--no-receipt`。
@@ -126,6 +128,7 @@ python3 status/status.py                                 # 适配器状态
 ```
 
 - ⚠️ **文件/图片必须用绝对路径**（如 `/home/sandbox/...`）：相对路径脚本自查能过，但 adapter 侧只接受以 `/` 开头的路径 → 该段被静默丢弃 → 只报「message 没有可发送的段」。
+- 发文件后数秒内，入站会出现一条**空内容事件**——那是对方**下载了你发的文件**的回执信号，不是新消息、无需回复（连续出现＝多次下载）；发图片/文字不会触发。
 - 其余动作与 JSON/XML payload 写法 → `references/actions.md`。
 
 ## 六、注意力机制

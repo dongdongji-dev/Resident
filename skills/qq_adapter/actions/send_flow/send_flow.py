@@ -29,9 +29,20 @@ xml 格式（标签集与切分口径 2026-10-19 约定，`--format xml`，后�
     属性 separate="true" 开＝块内的图片与表格各自单独占一条消息（默认关＝跟文字同一条气泡）。
   <table>…</table> 包裹的是 md 表格语法 ⇒ 渲染成 PNG 发出。**可以嵌进 text**（同 image）；
                    单独出现时自己占一条消息。
+    属性 style="…"  渲染风格，五选一：three（默认，论文三线表）/ compact（列多时用，字号小一档）/
+                   dark（黑表头白字＋白列线＋整片灰底）/ blue（蓝表头白字＋白浅蓝交替＋细黑线）/
+                   green（绿表头白字＋偶数行浅绿＋细黑线）。整批默认值走 CLI --table-style。
+    单元格内 **…**  局部加粗（可只加粗半句）；整行全加粗＝合计行（自动加粗＋上方补一条细线）。
+    多行表头      写两行表头，上层那行只在一组的第一列填字、其余留空＝自动跨列合并；
+                   上层单列且下层对应列为空＝自动跨行合并。
+    列对齐        分隔行写 :--- 左对齐、---: 右对齐，默认整列居中。
+    排版规则      画布固定 8.6 英寸 @150dpi；先调列宽让每格单行，无解逐档缩字号（13→9pt，
+                   9pt 是仿宋可渲染下限），再不行表头折两行，仍无解按原样输出。
   <image>…</image> 内联元素，内容是图片绝对路径；可放进 text 里（走 QQ 的消息段混排）。
                    也认 <image path="…"/>。
   <file>…</file>   文件绝对路径，走 send_file；**不能放进 text**（QQ 上文件是独立消息）。
+                   发出后数秒内入站会出现一条空内容事件（无文本无 segments）＝**对方下载了该文件**
+                   的回执信号，不是新消息、不用回复（发图片/文字不触发）。
   <poke qq="…"/>   戳一戳，target 用 qq=（也认 target=/target_id=）；**不能放进 text**。
   规则：① 只认这五个标签，其余内容全当纯文本（正文里的 & 和尖括号不用转义）；
         ② 标签之间的空白忽略，标签外的裸文本按行各发一条；
@@ -64,14 +75,14 @@ xml 格式（标签集与切分口径 2026-10-19 约定，`--format xml`，后�
      （回执时间＝核对完成那一刻，只到时分秒）。
   ③ 某条发不出去＝**丢包**：打 `✗ 编号 类型「前缀…」丢包：<原因>`，随即中止，
      剩下的不发（不并行连发）。末尾打「串行发送完成 N 条」与队列剩余行数。
-  ④ **拿不到 msgid 时不重发**（约定：重发＝同一条内容发两遍——请求超时
+  ④ **拿不到 msgid 时不重发**（用户 01:38 指出：重发＝同一条内容发两遍——请求超时
      或响应里没有 message_id，都不等于 QQ 侧没投递）。改成**超时核库**：
      在 `--msgid-timeout` 内轮询消息库，只看发送时刻之后新增的 out 记录，
      文本按正文比、图片/文件/戳按落库形态认（`<image file="base64://…"` / `[file]` / `[poke]`），
      **恰好一条**才算核到 ⇒ 打 `⚠ … 没拿到 msgid（原因）⇒ 不重发，按消息库对账补到 msgid=…` 并继续下一条；
      核不到、或窗口里同类型不止一条（歧义）⇒ 判丢包中止，队列里那块**不删**。
 
-防坑（风险点逐条实现）：
+防坑（用户 00:50 问的风险点，逐条实现）：
   ① 并发：`<md>.lock` 独占锁（O_CREAT|O_EXCL 原子创建＋锁里写 pid），抢不到退出码 4。
      ⚠ 本机工作区是宿主机映射的共享文件系统，**flock 实测不生效**，别用 flock。
   ② 丢消息：文本要**回执对账通过**、图片要 **get_msg 核到 msgid** 才算「已发送」，
@@ -118,7 +129,7 @@ SENT_SPLIT_RE = re.compile(r"(?<=[。！？；!?;])\s*")
 
 # ---------------------------------------------------------------- 文本清洗
 def peek(s: str, n: int = 5) -> str:
-    """给一条消息取「前 5 字…后 5 字」——前缀就够判断上一条截到哪。"""
+    """给一条消息取「前 5 字…后 5 字」——用户 01:01：前缀就够判断上一条截到哪。"""
     s = s.strip()
     if len(s) <= 2 * n:
         return s
@@ -193,8 +204,10 @@ def _inline_parts(inner: str) -> list[tuple[str, str]]:
         if m.start() > p:
             parts.append(("t", inner[p:m.start()]))
         attrs = _attrs(m.group(3))
+        sty = attrs.get("style")
         if m.group(4):
-            parts.append(("i" if m.group(2) == "image" else "T", _path_of(attrs, "")))
+            parts.append(("i" if m.group(2) == "image"
+                          else "T", {"md": "", "style": sty}))
             p = m.end()
         else:
             c = re.search(r"</%s>" % m.group(2), inner[m.end():], re.S)
@@ -202,7 +215,8 @@ def _inline_parts(inner: str) -> list[tuple[str, str]]:
                 raise XmlError(f"<{m.group(2)}> 没有闭合")
             body = inner[m.end():m.end() + c.start()]
             parts.append(("i" if m.group(2) == "image" else "T",
-                          _path_of(attrs, body) if m.group(2) == "image" else body))
+                          _path_of(attrs, body) if m.group(2) == "image"
+                          else {"md": body, "style": sty}))
             p = m.end() + c.end()
     if len(inner) > p:
         parts.append(("t", inner[p:]))
@@ -241,10 +255,11 @@ def _text_messages(inner: str, max_chars: int, split_nl: bool, separate: bool,
             if kind == "i":
                 segs = [("i", val.strip())]
             else:
-                header, body = parse_md_table([l for l in val.splitlines() if l.strip()])
+                d = val if isinstance(val, dict) else {"md": val}
+                header, body = parse_md_table([l for l in d["md"].splitlines() if l.strip()])
                 if not header:
                     raise XmlError("<table> 里没有可用的 md 表格")
-                segs = [("i", p) for p in render(header, body)]
+                segs = [("i", p) for p in render(header, body, d.get("style"))]
             if separate:
                 close()
                 msgs.extend([[s] for s in segs])
@@ -273,7 +288,7 @@ def _text_messages(inner: str, max_chars: int, split_nl: bool, separate: bool,
 
 
 def plan_xml(src: str, tmp_dir: Path, rows_per_img: int,
-             max_chars: int) -> list[dict]:
+             max_chars: int, table_style: str | None = None) -> list[dict]:
     """xml 切发送序列。一个标签块＝一个（或几个）消息，块带 span/hash 供删块定位。"""
     lines = src.splitlines()
     offsets, o = [], 0
@@ -288,11 +303,12 @@ def plan_xml(src: str, tmp_dir: Path, rows_per_img: int,
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tbl_no = 0
 
-    def render(header, body) -> list[str]:
+    def render(header, body, style: str | None = None) -> list[str]:
         nonlocal tbl_no
         tbl_no += 1
         prefix = str(tmp_dir / f"tbl{tbl_no:02d}")
-        return render_table(header, body, prefix, rows_per_img=rows_per_img)
+        return render_table(header, body, prefix, rows_per_img=rows_per_img,
+                            style=style or table_style)
 
     def loose(a: int, b: int) -> None:
         """标签外的裸文本：按行各发一条（整行作为删除单位）。"""
@@ -348,7 +364,7 @@ def plan_xml(src: str, tmp_dir: Path, rows_per_img: int,
             header, body = parse_md_table([l for l in inner.splitlines() if l.strip()])
             if not header:
                 raise XmlError("<table> 里没有可用的 md 表格")
-            for p in render(header, body):
+            for p in render(header, body, attrs.get("style")):
                 steps.append({"kind": "image", "payload": p,
                               "span": span, "hash": h, "raw": raw})
         elif tag == "image":
@@ -383,7 +399,7 @@ def block_hash(lines: list[str]) -> str:
 
 
 def plan(md_lines: list[str], tmp_dir: Path, rows_per_img: int,
-         max_chars: int) -> list[dict]:
+         max_chars: int, table_style: str | None = None) -> list[dict]:
     """切发送序列。每块带 span（行区间）与 hash（删块时定位用）。"""
     steps: list[dict] = []
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -405,7 +421,7 @@ def plan(md_lines: list[str], tmp_dir: Path, rows_per_img: int,
                         title = clean_line(md_lines[k])
                         break
                 for p in render_table(header, body, prefix, title=title,
-                                      rows_per_img=rows_per_img):
+                                      rows_per_img=rows_per_img, style=table_style):
                     steps.append({"kind": "image", "payload": p,
                                   "span": (i, j), "hash": block_hash(md_lines[i:j])})
             i = j
@@ -683,6 +699,10 @@ def main() -> int:
                    help="没拿到 msgid 时去消息库核这条的超时（默认 20s；**不重发**）")
     p.add_argument("--max-chars", dest="max_chars", type=int, default=160)
     p.add_argument("--rows-per-img", dest="rows_per_img", type=int, default=6)
+    p.add_argument("--table-style", dest="table_style", default="three",
+                   choices=["three", "compact", "dark", "blue", "green"],
+                   help="表格渲染风格（默认 three＝论文三线表）；"
+                        "也可在 xml 里按表选：<table style=\"compact\">")
     p.add_argument("--tmp-dir", dest="tmp_dir", default="/home/sandbox/tmp/flow")
     p.add_argument("--no-trim", dest="no_trim", action="store_true")
     p.add_argument("--lock-stale", dest="lock_stale", type=int, default=900,
@@ -718,8 +738,10 @@ def main() -> int:
 
     def make_plan(txt: str) -> list[dict]:
         if fmt == "xml":
-            return plan_xml(txt, Path(a.tmp_dir), a.rows_per_img, a.max_chars)
-        return plan(txt.splitlines(), Path(a.tmp_dir), a.rows_per_img, a.max_chars)
+            return plan_xml(txt, Path(a.tmp_dir), a.rows_per_img, a.max_chars,
+                            a.table_style)
+        return plan(txt.splitlines(), Path(a.tmp_dir), a.rows_per_img, a.max_chars,
+                    a.table_style)
 
     try:
         steps = make_plan(md_text)
