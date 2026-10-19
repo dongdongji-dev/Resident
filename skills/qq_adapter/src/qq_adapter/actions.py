@@ -47,7 +47,7 @@ class ActionExecutor:
         self._files_root = Path(files_root)
         self._base64_max_bytes = int(base64_max_bytes)
         # adapter 文件服务对外 URL 前缀（大文件 URL 直传；如
-        # 形如 http://<对外可达地址>:<端口>）
+        # http://host.docker.internal:18991 或远程真实地址）
         self._serve_url = str(serve_url or "").rstrip("/")
         # 仲裁：发送前查 core 会话未读数（force_exec=true 屏蔽仲裁）
         self._core_url = str(core_url or "").rstrip("/")
@@ -74,7 +74,7 @@ class ActionExecutor:
         出站消息有两条入库路径：①/hook 上报（本模块 _report_out）、
         ②NapCat message_sent 回显（handlers）。①原先把 sender 写死成
         {"identity_id": "agent"}，②带完整 sender，于是同一批消息在库里
-        出现两种格式（2026-10-09 约定发现）。这里把 ① 也补全，两条路径一致。
+        出现两种格式（2026-10-09 发现）。这里把 ① 也补全，两条路径一致。
         """
         sender: dict[str, Any] = {"identity_id": "agent"}
         if self_id:
@@ -191,7 +191,7 @@ class ActionExecutor:
 
     def _after_action(self, tag: str, element: dict[str, Any],
                       result: dict[str, Any] | None) -> None:
-        """出站动作成功后的注意力联动（2026-09-01 约定方案）：
+        """出站动作成功后的注意力联动（2026-09-01 方案）：
         - 发送类动作成功且目标是群会话 → follow() 自动切注意力到该群
           （该群新消息无需 @ 即唤醒）；
         - 其他针对群会话的成功动作 → touch() 刷新当前注意力群的
@@ -899,6 +899,14 @@ class ActionExecutor:
             message_id = str(data.get("message_id", ""))
             if message_id:
                 last_message_id = message_id
+            else:
+                # 2026-10-17：空 message_id（曾整批出现、原因未定位）时把
+                # NapCat 原始响应落日志，别再只留异常摘要。
+                logger.error(
+                    "send returned no message_id conv=%s status=%s retcode=%s"
+                    " resp=%s", conversation_id, response.get("status"),
+                    response.get("retcode"),
+                    json.dumps(response, ensure_ascii=False)[:800])
             # 发送成功 → out 消息上报（direction=out，remote_message_id=平台 id）
             self._report_out(conversation_id, conversation_type, message_id,
                              normal_segments)

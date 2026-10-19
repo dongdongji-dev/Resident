@@ -7,18 +7,28 @@
   python3 send_text.py group_200000001 "看这里" --at 1000000002   # @ 某人（自动补空格）
   python3 send_text.py group_200000001 "紧急" --force            # 跳过未读仲裁
   echo "多行" | python3 send_text.py group_200000001 -           # 从 stdin 读正文
-  python3 send_text.py group_200000001 --from-file /tmp/body.txt # 正文取自文件（推荐）
+  python3 send_text.py group_200000001 - <<'MSG'                 # ⭐默认姿势：一步发多行正文（heredoc + 带引号标记）
+  正文第一行，`反引号` $HOME "双引号" 全原样
+  第二行
+  MSG
+  python3 send_text.py group_200000001 --from-file /tmp/body.txt # 兜底：正文取自文件（heredoc 撞 bug 才用）
   python3 send_text.py group_200000001 "试" --dry-run            # 只看 payload 不发
   python3 send_text.py group_200000001 "不用核对" --no-receipt    # 跳过回执对账
   python3 send_text.py --conversation group_200000001 --text "具名写法"  # 等价（防呆别名，2026-10-15 加）
 
 会话键 = group_xxx / private_xxx（也认 bili_private_xxx 这类带前缀的）。
 默认发送后会做**回执对账**（经 core API 读消息库那条 out 记录逐字核对）；`--no-receipt` 跳过。
+**发错了可撤回**：`actions/recall/recall.py <message_id>`（message_id 就是本脚本回执里那个）；
+自己的消息随时能撤，管理员/群主可撤权限更低成员的。
 
 ⚠️ 转义：正文含反引号 `` ` ``、`$`、`!`、`\\` 等 shell 元字符时**别用双引号内联**——
    shell 会先做命令替换/变量展开，内容被吞掉（2026-09-26、2026-10-03 各踩一次）。
-   三种安全写法：① 单引号 `'...'` ② `-` 走 stdin ③ **`--from-file <路径>`（正文完全不过 shell，最稳）**。
-   `--from-file` 与正文参数二选一（给了文件就不用再写正文）。
+   安全写法按优先级（2026-10-17 约定：一步发，别分两步）：
+     ① **heredoc `<<'MSG'` + 正文参数写 `-`（默认）**——标记**必须带单引号**，结束标记单独一行、
+        行首无空格；标记名随自己定，正文里不能出现「整行只有该标记」的内容（撞了就换标记名）
+     ② **`--from-file <路径>`（兜底）**——正文完全不过 shell，逐字节最稳，与位置正文二选一
+     ③ 单引号 `'...'`（短正文）
+   判据实测：tests/test_send_text_payload.py（元字符逐字保留 + 双引号内联必被展开）。
 """
 from __future__ import annotations
 
@@ -84,6 +94,12 @@ def main() -> int:
         text = sys.stdin.read()
     else:
         text = args.text
+
+    # 2026-10-18 修复「每条消息末尾多了一个换行」：heredoc 与文件末尾自带换行，
+    # 直接进 payload 就成了消息尾部的空行。stdin / --from-file 两条通道统一去掉末尾换行
+    # （正文内部的换行、行内空格一律保留；inline 参数不动）。
+    if args.text == "-" or args.from_file:
+        text = text.rstrip("\r\n")
 
     content = []
     if args.reply:

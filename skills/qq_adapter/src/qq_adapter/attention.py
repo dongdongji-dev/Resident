@@ -4,16 +4,16 @@ The agent switches its "attention group" over HTTP (set_attention /
 get_attention hook actions); group messages in the attention group
 always wakeup the agent (no need to @). Only one group at a time.
 
-Auto-follow + idle expiry (2026-09-01 约定方案，已实现):
+Auto-follow + idle expiry (2026-09-01 方案，已实现):
 - follow(group_id): 向某群发送消息后自动把注意力切到该群（含刷新时间戳）；
 - touch(group_id):  对当前注意力群执行了任何成功操作 → 刷新活跃时间戳
                      （在 ActionExecutor 出站分派成功后统一调用）；
-- 闲置自动过期: 超过 IDLE_TIMEOUT_SECONDS（10 分钟）未对注意力群执行
+- 闲置自动过期: 超过 IDLE_TIMEOUT_SECONDS（默认 120 秒＝2 分钟）未对注意力群执行
                   任何操作 → 注意力自动关闭；检测时机 = 接收消息时
                   惰性检查（handlers.py _wakeup_for 每次收消息都会
                   调 ctx.attention.get()，正好是过期检测点）。
 
-变更通知（2026-10-12 约定方案，已实现）：
+变更通知（2026-10-12 方案，已实现）：
 - 注意力**状态发生转移**时（开→群 / 群→群 / 群→关），调用注入的
   notifier(reason, previous, current) 产生一条通知（`qq_self` 会话、
   message_type=attention、wakeup=True），告知：哪个会话、什么原因、
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -39,7 +40,8 @@ from typing import Callable, Optional
 logger = logging.getLogger("qq_adapter.attention")
 
 # 闲置超时：超过该时长未对注意力群执行任何操作 → 自动关闭注意力（秒）
-IDLE_TIMEOUT_SECONDS = 600  # 10 分钟
+# 2026-10-18 定为 120 秒（2 分钟）；原 600 太长。可用环境变量覆盖。
+IDLE_TIMEOUT_SECONDS = int(os.environ.get("QQ_ATTENTION_IDLE_SECONDS", "120"))
 
 # notifier 签名：(reason, previous_group, current_group) -> None
 Notifier = Callable[[str, str, str], None]
@@ -54,7 +56,7 @@ _REASON_LABEL = {
 def render_attention_notice(reason: str, previous: str, current: str) -> str:
     """把一次注意力变更渲染成给人看的一段通知文本。
 
-    内容三要素（2026-10-12 设计约定）：哪个会话变了 / 影响是什么 /
+    内容三要素（2026-10-12 约定）：哪个会话变了 / 影响是什么 /
     怎么开、关、查。
     """
     label = _REASON_LABEL.get(reason, reason)

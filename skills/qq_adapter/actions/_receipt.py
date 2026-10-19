@@ -2,16 +2,18 @@
 """_receipt.py — actions/ 共用：发送回执对账（对着 core 消息库逐字核对）。
 
 为什么要有：只看到 ok:true/message_id 不够——必须能确认「真正发出去的是什么」。
-2026-09-28 23:3x 设计约定后加；2026-10-12 从 scripts/send_msg.py 搬进 actions，
-让「走 action 发消息」也自带回执（否则我会下意识绕回老脚本，约定 23:22 点过）。
+2026-09-28 添加；2026-10-12 从 scripts/send_msg.py 搬进 actions，
+让「走 action 发消息」也自带回执（否则容易绕回老脚本，约定过）。
 
 判据（四情形）：
   ① 正常：有 message_id + **按 message_id 命中库记录**（首选）或逐字对账通过
-  ② 「无 out 消息」：落库延迟，等一会儿重取
+  ② 「无 out 消息」＝**回执未落库**：落库延迟，等一会儿重取；
+     ⚠️ 取记录必须**翻页翻到头**（`_api_messages_all`）——lastseq 落后超过一页时
+     单页 300 条根本够不到最新那条（2026-10-19 09:2x 实测误报，见该函数注释）。
   ③ 真·静默失败：ok:true 但 message_id 为 None、库里没有 out 记录 ⇒ 没发出去，原文重发
-  ④ 同号存在另一个登录端时：库里 out 序列里混着它的消息，**只做内容比对会误报
-     「不一致」**（它在自己那条之后又发了 out，最新 out 就对不上）——故先按
-     message_id 配对；两者都不中时提示用 tools/verify_self_send.py <msg_id> 复核。
+  ④ 同号另一端活跃：库里 out 序列里混着另一端的消息，**内容比对会误报「不一致」**——
+     故先按 message_id 配对（2026-10-17 回执误报修复时加）；
+     两者都不中时提示用 `.skills/qq_adapter/tools/verify_self_send.py <msg_id>` 复核。
 
 对账前会抹掉适配器的两类改写（HTML 转义、`<reply/>`/`<at/>` 前缀段），
 并跳过系统类 out 记录（`[消息撤回]` / `[notice` / `[系统`）。
@@ -78,6 +80,32 @@ def _api_messages(conv: str, after_seq: int, limit: int = 300) -> list:
     with opener.open(req, timeout=8) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return data.get("messages", []) if isinstance(data, dict) else data
+
+
+def _api_messages_all(conv: str, after_seq: int, page: int = 300,
+                      max_pages: int = 20) -> list:
+    """从 after_seq 往后**翻页取全**（首页只有 300 条）。
+
+    2026-10-19 09:2x 实测坑：lastseq 落后很多时（群 200000005 停在 6574，
+    实际已到 7427），`after_seq=6574&limit=300` 只返回 6575~6874 这一页，
+    我刚发的那条根本不在返回集里 ⇒ 三次轮询取的都是同一页（循环里没推进
+    after_seq），outs 里全是别人的 in 消息 → 误报「⚠️ 回执不一致（无 out 消息）」，
+    而 `verify_self_send.py` 复核＝本 adapter 正常发出。⇒ 必须翻页翻到头。
+    """
+    out: list = []
+    cur = after_seq
+    for _ in range(max_pages):
+        msgs = _api_messages(conv, cur, page)
+        if not msgs:
+            break
+        out.extend(msgs)
+        mx = max(int(m.get("seq", 0)) for m in msgs)
+        if mx <= cur:                      # 端点不推进（防死循环）
+            break
+        cur = mx
+        if len(msgs) < page:               # 最后一页
+            break
+    return out
 
 
 def _load_seq(conv: str) -> int:
@@ -157,9 +185,11 @@ def verify(conv: str, text: str, response: dict | str | None,
         want_mid = str(mid) if mid is not None else None
         outs: list = []
         for attempt in range(tries):
-            msgs = _api_messages(conv, before)
+            msgs = _api_messages_all(conv, before)
             if msgs:
-                _save_seq(conv, max(int(m.get("seq", 0)) for m in msgs))
+                newest = max(int(m.get("seq", 0)) for m in msgs)
+                _save_seq(conv, newest)
+                before = newest   # 下一轮从最新往后翻，别反复取同一页
             outs = [m for m in msgs if m.get("direction") == "out"
                     and not _is_system_out(m.get("content") or "")]
             # ① 首选：按 message_id 配对（同号另一端活跃时，内容比对会误报）
@@ -184,6 +214,9 @@ def verify(conv: str, text: str, response: dict | str | None,
         if want_mid:
             hint = (f"\n   ↳ 判据补充：用 `.skills/qq_adapter/tools/verify_self_send.py "
                     f"{want_mid}` 复核（同号另一端活跃时内容比对会误报）")
+        if not outs:
+            return (line + "\n   ⚠️ 回执未落库：这段时间库里没有该会话的 out 记录"
+                    "（多半是落库延迟，先按 message_id 复核，别急着重发）" + hint)
         return line + f"\n   ⚠️ 回执不一致：消息库最新 out 内容是「{last}」" + hint
     except Exception as exc:                              # noqa: BLE001
         return line + f"\n   ⚠️ 回执未对账（core API 不可达：{exc}）"

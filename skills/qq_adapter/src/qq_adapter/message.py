@@ -8,6 +8,7 @@ projection of the core ``messages`` row) and is submitted via
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -143,8 +144,8 @@ class MessageSubmitter:
         """在 core 创建一条**立即触发的 once 通知**（notice 通道）。
 
         适配器主动自我提醒走这里（如注意力状态转移）——notice 由 beat
-        在到点时推给 agent（呈现为一条通知），**不进 messages
-        库**（2026-10-12 约定明确：这类提示应是 notice，不是消息）。
+        在到点时推给 agent（我收到的是「通知 #NNN」），**不进 messages
+        库**（2026-10-12 明确：这类提示应是 notice，不是消息）。
         """
         payload = {"content": content, "kind": "once"}
         if notification:
@@ -200,6 +201,13 @@ class MessageSubmitter:
                         result.get("deduped"))
             return result
         except Exception as exc:  # noqa: BLE001
-            logger.error("submit failed conv=%s msg=%s: %s",
-                         draft.conversation_id, draft.remote_message_id, exc)
+            detail = ""
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:  # noqa: BLE001
+                    detail = "<body unreadable>"
+            logger.error("submit failed conv=%s msg=%s: %s body=%s",
+                         draft.conversation_id, draft.remote_message_id, exc,
+                         detail or "-")
             return None

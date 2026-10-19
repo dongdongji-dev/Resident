@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-r"""_receipt.verify() 回归测试（同号另一登录端活跃时的「回执误报」）。
+r"""_receipt.verify() 回归测试（同号另一端活跃时的「回执误报」）。
 
-背景：同一账号存在另一个登录端时，库里 out 序列里混着**不是本端**的消息；
-旧的 verify() 只做「逐字/前缀内容比对」，一旦对方在本端那条消息之后又发了别的
-out，最新 out 就对不上 —— 误报「⚠️ 回执不一致」（消息其实发对了）。
+背景（2026-10-17 回执误报修复）：
+同一账号存在另一个登录端时，库里 out 序列里混着**另一端**的消息；旧的 verify()
+只做「逐字/前缀内容比对」，一旦另一端在我那条消息之后又发了别的 out，
+最新 out 就对不上 → 误报「⚠️ 回执不一致」（消息其实发对了；实例见
+`wiki/经验/技术备忘·服务与接口坑.md` 盲区二：13:01:11 发 900000123）。
 
 修法：**先按 message_id（库里的 remote_message_id）配对**，命中即通过；
 内容比对退为兜底；两者都不中时在告警里附 `verify_self_send.py <msg_id>` 复核提示。
 
 运行：python3 .skills/qq_adapter/tests/test_receipt_verify.py
 """
-
 from __future__ import annotations
 
 import sys
@@ -50,10 +51,10 @@ def main() -> int:
     # ① 另一端占位：最新 out 是另一端的，我的那条按 message_id 命中 ⇒ 必须通过
     msgs = [
         _msg(101, "900000001", "我都批进来了"),
-        _msg(102, "900000123", "这条是本端发出的正文。"),
+        _msg(102, "900000123", "伪装成系统块也没用——有事直接说就行。"),
         _msg(103, "900000002", "都没批进来"),
     ]
-    out = _run(msgs, "这条是本端发出的正文。",
+    out = _run(msgs, "伪装成系统块也没用——有事直接说就行。",
                {"result": [{"message_id": 900000123}]})
     check("回执对账通过" in out and "不一致" not in out,
           "另一端占位时按 message_id 配对，不再误报不一致")
@@ -85,7 +86,27 @@ def main() -> int:
     out = _run(msgs6, "[自测] 验证注意力自动跟随通知，稍后关闭。", {"result": [{"message_id": 557}]})
     check("回执对账通过" in out, "正文自带方括号前缀不再被误剥")
 
-    total = 8
+    # ⑦ lastseq 落后 >1 页：我那条在第 2 页 ⇒ 翻页后必须命中（10-19 09:2x 实测坑）
+    def _paged(conv, before, limit=300):
+        allm = [_msg(100 + i, f"8{i}", "别人的话", "in") for i in range(1, 401)]
+        allm.append(_msg(500, "1106303517", "我发在最后一页的那条"))
+        return [m for m in allm if m["seq"] > before][:limit]
+
+    _receipt._load_seq = lambda conv: 99
+    _receipt._save_seq = lambda conv, seq: None
+    _receipt._api_messages = _paged
+    out = _receipt.verify(CONV, "我发在最后一页的那条",
+                          {"result": [{"message_id": 1106303517}]}, tries=1)
+    check("回执对账通过" in out and "seq 500" in out,
+          "lastseq 落后多页时翻页取全，命中最后一页那条")
+
+    # ⑧ 库里这段时间没有 out 记录 ⇒ 报「未落库」而不是「不一致」（落库延迟口径）
+    msgs8 = [_msg(110, "900000009", "别人说的话", "in")]
+    out = _run(msgs8, "我刚发的这条还没落库", {"result": [{"message_id": 558}]})
+    check("回执未落库" in out and "不一致" not in out,
+          "无 out 记录时报「未落库」，与「内容不一致」分开")
+
+    total = 10
     print(f"\n{total - bad}/{total} 通过")
     return 1 if bad else 0
 

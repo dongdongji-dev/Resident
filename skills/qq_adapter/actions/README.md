@@ -61,6 +61,7 @@
 | `send_file` | 往一个会话发一个文件。 | (手写/组合动作) |
 | `send_image` | 往一个会话发一张图片。 | (手写/组合动作) |
 | `send_text` | 往一个会话发一条纯文本消息。 | (手写/组合动作) |
+| `send_flow` | 发送队列（md 或 xml）：md 按行切多条；xml 只按元素切（`<text>`/`<table>`/`<image>`/`<file>`/`<poke>`，属性 `split=`/`separate=`）。表格渲染成图、图片走 send_image、文件走 send_file，串行发送（拿到 msgid 才发下一条），核到回执才删队列里那块。**拿不到 msgid 不重发**——按 `--msgid-timeout` 去消息库核这条（核到补 msgid，核不到判丢包）。**发出去的可撤回**＝`actions/recall/recall.py <msgid>`（动作元素 `delete_msg`）。 | (手写/组合动作) |
 | `status` | 看适配器状态。 | (手写/组合动作) |
 
 `python3 _generate.py` 可按 `_spec.yaml` 补生成缺失脚本（`--list` 只看、`--force` 覆盖、`--only a b` 指定）；手写的动作不放进 `_spec.yaml` 就不会被覆盖。

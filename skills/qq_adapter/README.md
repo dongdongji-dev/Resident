@@ -11,9 +11,11 @@ config/default.yaml   # 通用默认（零身份、零密钥）
 config/local.yaml     # 本机覆盖（连接地址、白名单、端口）——不进分发包
 src/qq_adapter/       # 常驻服务本体（python 包）
 actions/              # 对该服务的一套操作，走 HTTP（actions/README.md 有索引）
-  send_text/          #   发文本（--reply / --at / --force / --from-file）
+  send_text/          #   发文本（--reply / --at / --force / heredoc / --from-file）
+  send_flow/          #   多发串（按行或按 XML 元素切分，串行发送 + 回执核销）
   send_file/ send_image/ recall/ poke/ attention_set/ attention_get/ status/
   <动作名>/<动作名>.py  # 其余按动作名分目录，一个目录一件事
+references/           # 参考文档（actions 全集 / 入站排障 / 账号安全取证）
 tools/                # 辅助脚本（发送链取证）
 tests/                # 回归测试（参数防呆、自己消息去重、媒体上限等）
 requirements.txt      # aiohttp + PyYAML
