@@ -30,7 +30,7 @@ QQ/NapCat ←WS→ [qq_adapter 常驻] ←HTTP→ core(18086)
 │   ├── default.yaml       # 通用默认：零身份、零密钥
 │   └── local.yaml         # 本机覆盖：连接地址、白名单、端口
 ├── src/qq_adapter/        # 常驻服务本体（python 包）
-├── actions/               # 动作层，走 HTTP（索引见 actions/README.md）
+├── actions/               # 动作层，走 HTTP：send_text（单条）/ send_flow（多发串）；索引见 actions/README.md
 ├── references/            # 参考文档
 ├── tools/                 # 辅助脚本（发送链取证）
 └── tests/                 # 回归测试
@@ -62,6 +62,8 @@ PYTHONPATH=src NAPCAT_TOKEN=... CORE_API_KEY=... \
 - 依赖：aiohttp + PyYAML（见 `requirements.txt`）。
 
 ## 三、发送消息：`actions/send_text/send_text.py`
+
+> 只发**一条** → 本工具；一次要发**多条**、长文按点拆分，或正文含**表格** → 用 `send_flow`（第四节）。
 
 ```bash
 cd .skills/qq_adapter/actions
@@ -99,7 +101,7 @@ MSG
 
 ## 四、多发串：`actions/send_flow/send_flow.py`
 
-把一个文档当**发送队列**：逐条串行发送——一条拿到 message_id 才发下一条；核到回执后把已发送的那块从 md 里自动删掉。QQ 会把含换行的消息拆成多个气泡，所以设计上「一条消息一个点」，别用换行分段。
+把一个文档当**发送队列**：逐条串行发送——一条拿到 message_id 才发下一条；核到回执后把已发送的那块从 md 里自动删掉。适合一次发多条消息、长文按点拆分、含表格的报告（表格自动渲染成图）。QQ 会把含换行的消息拆成多个气泡，所以设计上「一条消息一个点」，别用换行分段。
 
 ```bash
 python3 send_flow/send_flow.py private_1000000002 /home/sandbox/tmp/note.md      # md：一行＝一条
