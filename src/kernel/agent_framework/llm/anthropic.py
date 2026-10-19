@@ -133,7 +133,8 @@ class AnthropicLLM:
                  cap_seconds: float = 60.0,
                  user_agent: str = "",
                  session_id: str = "",
-                 input_modalities: Optional[list[str]] = None) -> None:
+                 input_modalities: Optional[list[str]] = None,
+                 stream_idle_timeout_seconds: float = 90.0) -> None:
         self.user_agent = str(user_agent or "")
         self.session_id = str(session_id or "")
         self.input_modalities = tuple(input_modalities) \
@@ -147,6 +148,8 @@ class AnthropicLLM:
         self.proxy = proxy
         self.backoff_base = float(backoff_base)
         self.cap_seconds = float(cap_seconds)
+        self.stream_idle_timeout_seconds = float(
+            stream_idle_timeout_seconds or 0)
         self.ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     _RETRYABLE = (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError,
@@ -210,7 +213,10 @@ class AnthropicLLM:
         result = LLMResult()
         calls: dict[int, dict[str, str]] = {}
         current_block = -1
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        idle = self.stream_idle_timeout_seconds
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout_seconds,
+            sock_read=idle if idle > 0 else None)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 f"{self.base_url}/messages", json=payload,

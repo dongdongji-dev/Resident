@@ -366,6 +366,38 @@ class MessagesStore:
             + " AND ".join(clauses), tuple(params))
         return int(row["n"])
 
+    def session_exists(self, session: str,
+                       include_archive: bool = False) -> bool:
+        """True when at least one message exists for
+        ``platform:conversation_id`` (malformed input -> False).
+        ``include_archive`` also checks the messages_archive table."""
+        try:
+            platform, conversation_id = _parse_thread(session)
+        except ValueError:
+            return False
+        tables = ["messages"]
+        if include_archive:
+            self._ensure_archive()
+            tables.append("messages_archive")
+        for table in tables:
+            row = self._db.query_one(
+                f"SELECT 1 AS ok FROM {table} WHERE platform = ? "
+                "AND conversation_id = ? LIMIT 1",
+                (platform, conversation_id))
+            if row is not None:
+                return True
+        return False
+
+    def recent_sessions(self, limit: int = 8) -> list[str]:
+        """Distinct sessions ordered by most recent activity (hints
+        for the focus-mode session validation)."""
+        rows = self._db.query(
+            "SELECT platform, conversation_id, MAX(seq) AS last_seq "
+            "FROM messages GROUP BY platform, conversation_id "
+            "ORDER BY last_seq DESC LIMIT ?", (int(limit),))
+        return [f"{row['platform']}:{row['conversation_id']}"
+                for row in rows]
+
     def clear_unread_before(self, thread: str, before_time: str,
                              show: int = 0) -> tuple[int, list[dict[str, Any]]]:
         """Mark read every unread in-bound message of the conversation with

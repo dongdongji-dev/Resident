@@ -42,8 +42,10 @@ messages_tools:
 
 # agent：框架行为参数（全部来自配置）
 agent:
-  # 工具执行总超时（秒）
-  tool_timeout_seconds: 60
+  # 工具执行总超时（秒）。必须大于 workspace_tools 内部超时上限
+  # （exec_max_timeout_seconds / fs_timeout_seconds），并留 10~15 秒余量；
+  # 否则工具内部超时整理出的「终止前部分输出」会被框架超时先取消丢弃。
+  tool_timeout_seconds: 90
   # 工具结果通用字符上限（兜底）：任何工具输出超过该长度即截断并把
   # 完整结果落盘（防个别工具忘记自身截断把上下文撑爆）
   tool_result_max_chars: 50000
@@ -174,6 +176,13 @@ beat:
   archive_interval_hours: 24
   # 定时任务：归档多少天前的已读消息（未读永不归档）
   archive_days: 30
+
+# 专注模式：模型可用 focus_mode 工具开启的有上限免打扰窗口
+focus:
+  # 单次专注最长分钟数（工具传值超过该上限会被截断）
+  max_minutes: 120
+  # 专注期间提醒通知的间隔分钟数
+  reminder_minutes: 3
 
 # events_port：独立事件端口（另一个端口，向 kernel 添加事件的投递通道）。
 # 事件类型（kind）暂未定义，后续扩展；当前只把事件送入 beat 事件队列。
@@ -328,6 +337,9 @@ llm:
   api_key: ${LLM_API_KEY}
   model: ${LLM_MODEL}
   timeout_seconds: 600
+  # 流空闲超时（秒）：连续 N 秒收不到任何数据（含等待首包）即断开
+  # 并重试——把链路静默时的 600s 干等缩短到 ~90s；0=关闭。
+  stream_idle_timeout_seconds: 90
   retries: 2
   retry_delay_seconds: 1.5
   # 指数退避：delay * backoff_base^attempt，退避上限 cap_seconds

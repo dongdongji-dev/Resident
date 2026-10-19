@@ -35,7 +35,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kernel.agent_framework.logging_setup import get_logger
 from kernel.agent_framework.paths import open_file_inside
@@ -157,6 +157,15 @@ def _save_artifact(executor: WorkspaceExecutor, truncated_dir: str,
         return executor.runtime_path(host)
     except Exception:  # noqa: BLE001 — 缓存失败不掩盖主结果
         return ""
+
+
+def _partial_text(value: Any) -> str:
+    """TimeoutExpired 携带的部分输出，统一归一为 str。"""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
 
 
 def _truncate_with_save(executor: WorkspaceExecutor, truncated_dir: str,
@@ -466,9 +475,10 @@ def register_workspace_tools(registry: ToolRegistry,
         min(timeout, exec_max_timeout_seconds 配置上限)——传再大也会被
         截断**：前台 exec 的本质是阻塞等待，只应等一小会儿，不要用它跑
         长任务，也不要指望设置大 timeout 来延长等待。workdir 默认工作区
-        根目录（运行时路径，沙箱模式下为容器内路径）。超时会被中断并
-        提示转 workspace_exec_async（后台执行）。返回 returncode +
-        stdout + stderr。"""
+        根目录（运行时路径，沙箱模式下为容器内路径）。超时会被中断
+        强制终止，**并保留终止前已产生的部分输出**（returncode=timeout
+        标记）；长任务请改用 workspace_exec_async（后台执行）。
+        返回 returncode + stdout + stderr。"""
         requested = cfg.exec_default_timeout_seconds if timeout is None \
             else float(timeout)
         effective = min(requested, cfg.exec_max_timeout_seconds)
@@ -484,10 +494,20 @@ def register_workspace_tools(registry: ToolRegistry,
             return (f"returncode={result.returncode}\n"
                     f"stdout:\n{stdout}{stdout_hint}\n"
                     f"stderr:\n{stderr}{stderr_hint}")
-        except subprocess.TimeoutExpired:
-            return (f"执行超时：命令未在 {effective:g} 秒内完成"
-                    f"（前台等待上限 = min(timeout, "
+        except subprocess.TimeoutExpired as exc:
+            stdout, stdout_hint = _truncate_with_save(
+                executor, cfg.truncated_dir, _partial_text(exc.stdout),
+                "exec_stdout", cfg.exec_output_max_chars)
+            stderr, stderr_hint = _truncate_with_save(
+                executor, cfg.truncated_dir, _partial_text(exc.stderr),
+                "exec_stderr", cfg.exec_output_max_chars)
+            return (f"⏱ 执行超时：命令未在 {effective:g} 秒内完成，"
+                    f"已被强制终止（前台等待上限 = min(timeout, "
                     f"{cfg.exec_max_timeout_seconds:g} 秒配置上限)）。\n"
+                    "以下为终止前已产生的输出（可能不完整）：\n"
+                    f"returncode=timeout\n"
+                    f"stdout:\n{stdout}{stdout_hint}\n"
+                    f"stderr:\n{stderr}{stderr_hint}\n"
                     f"长任务请使用 workspace_exec_async（后台执行，"
                     f"上限 {cfg.exec_async_timeout_seconds:g} 秒）")
         except Exception as exc:  # noqa: BLE001

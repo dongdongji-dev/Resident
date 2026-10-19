@@ -104,7 +104,8 @@ class OpenAICompatibleLLM:
                  cap_seconds: float = 60.0,
                  user_agent: str = "",
                  session_id: str = "",
-                 input_modalities: Optional[list[str]] = None) -> None:
+                 input_modalities: Optional[list[str]] = None,
+                 stream_idle_timeout_seconds: float = 90.0) -> None:
         knobs = _VARIANTS.get(variant, _VARIANTS["generic"])
         self.user_agent = str(user_agent or "")
         self.session_id = str(session_id or "")
@@ -124,6 +125,8 @@ class OpenAICompatibleLLM:
         self.proxy = proxy
         self.backoff_base = float(backoff_base)
         self.cap_seconds = float(cap_seconds)
+        self.stream_idle_timeout_seconds = float(
+            stream_idle_timeout_seconds or 0)
         self.ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     _RETRYABLE = (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError,
@@ -180,7 +183,10 @@ class OpenAICompatibleLLM:
                            on_delta: Optional[DeltaCallback]) -> LLMResult:
         result = LLMResult()
         calls: dict[int, dict[str, str]] = {}
-        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        idle = self.stream_idle_timeout_seconds
+        timeout = aiohttp.ClientTimeout(
+            total=self.timeout_seconds,
+            sock_read=idle if idle > 0 else None)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 f"{self.base_url}/chat/completions", json=payload,

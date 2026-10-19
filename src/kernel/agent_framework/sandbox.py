@@ -50,6 +50,15 @@ from kernel.osdb.notice import NoticeStore
 
 logger = get_logger("kernel.agent_framework.sandbox")
 
+
+def _as_text(value: object) -> str:
+    """TimeoutExpired 携带的部分输出，统一归一为 str。"""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
 # fsops 脚本在运行时内的落点：沙箱走 workspace 绑定的隐藏目录
 # （重建容器/重启内核后仍在，且重启内核时会校验并刷新），宿主模式直接用包内文件。
 _RUNTIME_DIR = ".resident"
@@ -214,9 +223,12 @@ class WorkspaceExecutor:
                                workdir=workdir)
             record.update(status="done", returncode=result.returncode,
                           stdout=result.stdout, stderr=result.stderr)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            # 超时同样保留终止前的部分输出（TimeoutExpired 自带）
             record.update(status="timeout",
-                          error=f"超过时限 {timeout:g} 秒")
+                          error=f"超过时限 {timeout:g} 秒（已强制终止）",
+                          stdout=_as_text(exc.stdout),
+                          stderr=_as_text(exc.stderr))
         except Exception as exc:  # noqa: BLE001
             logger.warning("sandbox task %s error: %s", task_id, exc)
             record.update(status="error", error=str(exc))
@@ -242,6 +254,9 @@ class WorkspaceExecutor:
                     lines.append(f"输出: {stdout[:200]}")
             else:
                 lines.append(f"错误: {record.get('error', '')}")
+                stdout = str(record.get("stdout") or "").strip()
+                if stdout:
+                    lines.append(f"终止前输出: {stdout[:200]}")
             lines.append(
                 f"结果文件: "
                 f"{self.container_async_log_dir}/{record['task_id']}.json")

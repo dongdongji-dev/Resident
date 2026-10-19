@@ -40,6 +40,21 @@ def _threads_list(threads: Any) -> list[str]:
     return values
 
 
+def _session_warnings(store: MessagesStore, threads: list[str],
+                      skip: tuple[str, ...] = ()) -> str:
+    """防呆：这些会话名在消息库（含归档）里从未出现过——多为
+    platform 或会话 id 写错。返回警告文本；空串表示无可疑会话。"""
+    missing = [t for t in threads
+               if t not in skip
+               and not store.session_exists(t, include_archive=True)]
+    if not missing:
+        return ""
+    quoted = "、".join(f"「{t}」" for t in missing)
+    return (f"⚠️ 警告：会话 {quoted} 在消息库中从未存在过任何消息，"
+            "请检查会话名是否正确（格式应为 platform:conversation_id，"
+            "可用 messages_threads 查看真实会话列表）。")
+
+
 def _sender_name(message: dict[str, Any]) -> str:
     sender = message.get("sender_data") or {}
     return str(sender.get("nickname", sender.get("name", "")))
@@ -112,6 +127,7 @@ def make_messages_conversations(store: MessagesStore, config: dict) -> Any:
         未读不受影响（仍会触发唤醒携带）。**
         """
         thread_list = _threads_list(threads)
+        warning = _session_warnings(store, thread_list)
         latest = int(latest) or int(config.get("list_latest", 5))
         max_chars = int(max_chars) or int(config.get("content_max_chars", 300))
         ordered = [store.thread_stats(thread) for thread in thread_list]
@@ -145,7 +161,10 @@ def make_messages_conversations(store: MessagesStore, config: dict) -> Any:
             })
         if read_keys:
             store.mark_sent_to_llm(read_keys)
-        return {"count": len(result), "conversations": result}
+        payload = {"count": len(result), "conversations": result}
+        if warning:
+            payload["warning"] = warning
+        return payload
 
     return conversations
 
@@ -165,6 +184,7 @@ def make_messages_unread(store: MessagesStore, config: dict) -> Any:
         unread_window_hours 小时内的（配置），更早的未读不计入。
         """
         thread_list = _threads_list(threads)
+        warning = _session_warnings(store, thread_list)
         x = int(x) or int(config.get("unread_latest", 20))
         max_chars = int(config.get("content_max_chars", 300))
         window = float(config.get("unread_window_hours", 0))
@@ -198,7 +218,10 @@ def make_messages_unread(store: MessagesStore, config: dict) -> Any:
                 "unread_remaining": max(0, unread_total - len(items)),
                 "messages": items,
             })
-        return {"count": len(result), "threads": result}
+        payload = {"count": len(result), "threads": result}
+        if warning:
+            payload["warning"] = warning
+        return payload
 
     return unread
 
@@ -221,6 +244,7 @@ def make_messages_clear_unread(store: MessagesStore,
         （便于确认清了什么）+ 未展示条数。
         """
         thread_text = str(thread or "")
+        warning = _session_warnings(store, [thread_text])
         before = str(before_time or "")
         show = int(show) or int(config.get("clear_show", 10))
         max_chars = int(config.get("content_max_chars", 300))
@@ -242,12 +266,15 @@ def make_messages_clear_unread(store: MessagesStore,
                 else content,
                 "truncated_chars": truncated_chars,
             })
-        return {"ok": True, "thread": thread_text,
-                "before_time": before,
-                "cleared": cleared,
-                "shown": len(items),
-                "not_shown": max(0, cleared - len(items)),
-                "messages": items}
+        payload = {"ok": True, "thread": thread_text,
+                   "before_time": before,
+                   "cleared": cleared,
+                   "shown": len(items),
+                   "not_shown": max(0, cleared - len(items)),
+                   "messages": items}
+        if warning:
+            payload["warning"] = warning
+        return payload
 
     return clear_unread
 
@@ -298,6 +325,8 @@ def make_messages_range(store: MessagesStore, config: dict) -> Any:
             raise ValueError(
                 "threads/start_time/end_time 至少提供一个筛选条件")
         threads_list = list(threads) if threads else None
+        warning = _session_warnings(store, threads_list or [],
+                                    skip=("system:all",))
         max_chars = int(max_chars) or int(config.get("range_max_chars", 10000))
         limit = int(limit) or int(config.get("range_limit", 200))
         messages = store.messages_by_range(
@@ -323,13 +352,16 @@ def make_messages_range(store: MessagesStore, config: dict) -> Any:
             carried_keys.append(message["conversation_key"])
         if carried_keys:
             store.mark_sent_to_llm(carried_keys)
-        return {
+        payload = {
             "count": len(items),
             "scope": {"threads": threads_list or "system:all",
                       "start_time": start_time, "end_time": end_time,
                       "include_archive": bool(include_archive)},
             "messages": items,
         }
+        if warning:
+            payload["warning"] = warning
+        return payload
 
     return range_query
 

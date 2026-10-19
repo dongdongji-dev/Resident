@@ -46,6 +46,8 @@ def create_llm_client(config: dict[str, Any]) -> LLMClient:
         "user_agent": str(config.get("user_agent", "")),
         "session_id": str(config.get("session_id", "")),
         "input_modalities": list(_input_modalities(config)),
+        "stream_idle_timeout_seconds": float(
+            config.get("stream_idle_timeout_seconds", 90)),
     }
     if protocol in ("openai", "responses", "openai-responses"):
         from kernel.agent_framework.llm.responses import OpenAILLM
