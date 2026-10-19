@@ -47,10 +47,3 @@ requirements.txt      # aiohttp + PyYAML
 动作全集（发送 / 管理 / 审批 / 查询 / 注意力 / 删除）见 `SKILL.md` 与
 `actions/README.md`；高风险动作默认禁用，开关写在 `config/local.yaml` 的**顶层**
 `actions:` 键（放 napcat 段里会静默失效）。
-
-## 历史
-
-- 2026-08-21 从老项目 napcat_adapter 全量改造到 Resident Kernel 架构。
-- 2026-10-12 重构为通用 skill：`src/` + `config/` 分层、`actions/` 归口、`start.sh` 置顶、数据外置到 `skill_data/`。
-- 2026-10-18 注意力闲置过期缩短为 120 秒（`QQ_ATTENTION_IDLE_SECONDS` 可覆盖）；send_text 修复正文末尾多余换行。
-- 2026-10-19 发送链路增强：新增 send_flow 多发串；表格渲染升级为论文三线表（五种风格，缺字体自动回退系统字体）；回执对账支持翻页（修复 lastseq 落后导致的误报）。
