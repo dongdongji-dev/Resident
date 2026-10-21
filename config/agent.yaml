@@ -377,10 +377,11 @@ compression:
   # （单张 384KB 图 ≈ 52 万字符 → 17 万假 token，一贴图就误触发压缩）；
   # 该值只作用于「尚未被 provider usage 覆盖」的尾部图片，保守取 4000。
   image_tokens_estimate: 4000
-  # 压缩 LLM 输入（记忆提取/摘要）与 checkpoint recent 序列化的字符上限：
+  # 压缩 LLM 输入（记忆提取/摘要）的字符上限：
   # 超限保留头尾、中间省略，保证压缩请求与压缩产物本身不超模型上限
   max_input_chars: 200000
-  # 第二步：摘要 + 保留最近「刚好小于 keep_recent_tokens」的若干整轮
+  # 保留最近「刚好小于 keep_recent_tokens」的若干整轮为原文（不删、不序列化）；
+  # 摘要与记忆提取都只输入更早的、将被摘要替换的部分（这些整轮不进入二者输入）
   keep_recent_tokens: 16000
   summary_prompt_file: config/prompt/compression_summary.md
   # 压缩完成后的整理提醒模板（agent 收到的 user notice）：

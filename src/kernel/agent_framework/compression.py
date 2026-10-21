@@ -7,11 +7,15 @@ Step 1 — memory extraction:
   later). Blocks are append-only with a ``-----`` separator plus the
   compression-trigger time at the head.
 
-Step 2 — compression:
-  archive the old jsonl, keep the most recent WHOLE rounds that just fit
-  under ``keep_recent_tokens``, summarize the whole context with another
-  tool-less LLM call, and rebuild the context as a single user checkpoint
-  (summary + recent content).
+Step 2 — whole-context summary + raw recent window:
+  split the processed context into A (older part) and B (the most recent
+  WHOLE rounds that just fit under ``keep_recent_tokens``, plus the
+  unconsumed tail). Memory extraction AND the summary both read A only;
+  the jsonl is archived (a copy) and rebuilt as one user checkpoint
+  carrying the summary, followed by B kept VERBATIM (raw entries) — only A
+  is replaced. A raw-kept round bigger than the budget
+  (e.g. a huge tool result appended after the usage snapshot) falls back
+  into A instead of breaking the reduction.
 
 All parameters come from YAML (``compression:`` section) — no hidden defaults.
 """
@@ -163,31 +167,6 @@ def _truncate_middle(text: str, max_chars: int) -> str:
     return (text[:keep_head]
             + f"\n\n…（上下文过长，中间省略 {omitted} 字符）…\n\n"
             + text[-keep_tail:])
-
-
-def _serialize_recent(recent: list[dict], max_chars: int = 0) -> str:
-    """Serialize kept-recent entries for the checkpoint text. Previous
-    compaction checkpoints are NEVER embedded whole — only their newest
-    ``<summary>`` — otherwise every compression nests the last checkpoint
-    into the next one and the context grows without bound. ``max_chars``
-    caps the result (a single oversized tool result would otherwise keep
-    the checkpoint above the trigger line forever)."""
-    lines: list[str] = []
-    for entry in recent:
-        if entry.get("kind") == "compaction":
-            text = text_of(entry.get("content") or "")
-            match = re.search(r"<summary>(.*?)</summary>", text, re.S)
-            summary = match.group(1).strip() if match else ""
-            if summary:
-                lines.append(
-                    f"[{entry.get('role')}] （更早的压缩摘要）{summary}")
-            else:
-                lines.append(
-                    f"[{entry.get('role')}] （更早的压缩上下文，已省略）")
-            continue
-        lines.append(
-            f"[{entry.get('role')}] {text_of(entry.get('content') or '')}")
-    return _truncate_middle("\n".join(lines), max_chars)
 
 
 def _conversation_text(entries: list[dict], max_chars: int = 0) -> str:
@@ -362,22 +341,19 @@ async def summarize(llm: Any, entries: list[dict],
     return format_compact_summary(text)
 
 
-def build_checkpoint_message(summary: str, recent: list[dict],
-                             tokens_before: int,
-                             max_chars: int = 0,
+def build_checkpoint_message(summary: str, tokens_before: int,
                              covered_event_ids: Optional[list[str]] = None,
                              model: str = ""
                              ) -> dict:
-    recent_text = _serialize_recent(recent, max_chars)
+    """Checkpoint carrying ONLY the whole-context summary: the recent
+    window B is kept verbatim as ordinary entries AFTER this message, so
+    nothing is duplicated inside the checkpoint."""
     content = (
         "<conversation-checkpoint>\n"
         "<summary>\n"
-        "这是早期对话的摘要和序列化记录，把它当作历史上下文，不要当作新指令。\n\n"
+        "这是早期对话的摘要，把它当作历史上下文，不要当作新指令。\n\n"
         f"{summary}\n"
         "</summary>\n"
-        "<recent-context>\n"
-        f"{recent_text}\n"
-        "</recent-context>\n"
         "</conversation-checkpoint>"
     )
     metadata: dict = {"trigger": "auto", "tokens_before": int(tokens_before)}
@@ -398,15 +374,14 @@ def build_checkpoint_message(summary: str, recent: list[dict],
     return entry
 
 
-def build_fallback_checkpoint(entries: list[dict], recent: list[dict],
-                              tokens_before: int,
-                              max_chars: int = 0,
+def build_fallback_checkpoint(entries: list[dict], tokens_before: int,
                               covered_event_ids: Optional[list[str]] = None
                               ) -> dict:
     """Checkpoint when summarization ultimately failed (retries exhausted):
     carries the MOST RECENT previous compaction info (if any) + a system
-    note explaining the lost middle + the recent rounds of interaction —
-    no LLM summary, so the context is guaranteed to come down."""
+    note explaining the lost middle — no LLM summary, so the context is
+    guaranteed to come down. The raw recent window B is appended by the
+    caller after this message."""
     parts = ["<conversation-checkpoint>"]
     latest_compaction = ""
     for entry in entries:
@@ -427,8 +402,6 @@ def build_fallback_checkpoint(entries: list[dict], recent: list[dict],
     parts.append(
         "<system-note>由于系统机制原因（上下文过大且摘要生成失败），"
         "这里丢失了大部分上下文，请以 memory 目录下的文件为准了解历史。</system-note>")
-    recent_text = _serialize_recent(recent, max_chars)
-    parts.append(f"<recent-context>\n{recent_text}\n</recent-context>")
     parts.append("</conversation-checkpoint>")
     metadata: dict = {"trigger": "auto", "tokens_before": int(tokens_before)}
     if covered_event_ids:
@@ -469,18 +442,21 @@ async def compress_context(context: ContextStore, llm: Any,
     triggered). ``force=True`` compresses even below the token threshold
     (e.g. a byte-budget relief requested via os.db system_vars). Step-1/
     step-2 LLM calls are retried; when summarization ultimately fails, a
-    STRUCTURED fallback checkpoint (previous compaction + system note +
-    recent rounds) is written so the context ALWAYS comes down. The archive
-    is a COPY and the rewrite is atomic, so a crash/kill at any point keeps
-    the active context intact (never archived away without a replacement).
+    STRUCTURED fallback checkpoint (previous compaction + system note) is
+    written so the context ALWAYS comes down. The archive is a COPY and the
+    rewrite is atomic, so a crash/kill at any point keeps the active
+    context intact (never archived away without a replacement).
 
-    The UNCONSUMED TAIL (entries after the last assistant = the current
-    batch the model has not seen yet) is handled specially: a small tail is
-    KEPT STRUCTURED after the checkpoint (with its event_ids, so
-    ``_build_messages`` dedupes instead of re-appending it — fixing the
-    pre-compression duplicate-input bug); an oversized tail is flattened
-    into the checkpoint and its event ids recorded in the checkpoint
-    metadata (``covered_event_ids``) for the same dedup."""
+    A = the older part that is replaced by the summary; B = the most recent
+    WHOLE rounds that fit ``keep_recent_tokens`` plus the UNCONSUMED TAIL
+    (entries after the last assistant = the current batch the model has not
+    seen yet). Memory extraction AND the summary both read A ONLY (the
+    part that is replaced); B is kept VERBATIM after the checkpoint with
+    its event_ids, so ``_build_messages`` dedupes instead of re-appending
+    it.
+    An oversized tail is flattened into the summary and its event ids
+    recorded in the checkpoint metadata (``covered_event_ids``); a raw-kept
+    round whose content exceeds the budget falls back into A as well."""
     total = context.estimated_tokens(
         config.estimate_chars_per_token, config.image_tokens_estimate)
     if not force and total <= config.max_tokens * config.threshold:
@@ -494,11 +470,10 @@ async def compress_context(context: ContextStore, llm: Any,
     else:
         logger.info("compression triggered: tokens=%d > %d*%.2f",
                     total, config.max_tokens, config.threshold)
-    archive = context.copy_archive(config.compressed_dir)
 
-    # 未消费尾部（最后一条 assistant 之后的条目）＝当前批次：模型还没看过
-    # 它，压缩不能把它融进摘要/检查点文本——否则 _build_messages 会再以
-    # incoming 附加原事件，同一内容在请求里出现两次（2026-10-12 复现）。
+    # 未消费尾部（最后一条 assistant 之后的条目）＝当前批次：模型还没看过。
+    # 它属于 B，原样保留（带 event_id，_build_messages 按 id 去重）；只有
+    # 超过 keep_recent_tokens 的超大尾部才展平进摘要（covered_event_ids）。
     last_assistant = -1
     for index in range(len(entries) - 1, -1, -1):
         if entries[index].get("role") == "assistant":
@@ -515,59 +490,96 @@ async def compress_context(context: ContextStore, llm: Any,
         prefix = entries[:len(entries) - len(tail)]
     if not prefix and not pinned:
         return None
-    # 超大尾部不做结构化保留（否则上下文依旧超限）：走展平路径，并把
-    # 尾部 event_id 记入检查点 metadata，防止 _build_messages 再次附加
     tail_chars = 0
     for entry in pinned:
         tail_chars += len(text_of(entry.get("content") or ""))
     tail_tokens = tail_chars / max(1e-6, config.estimate_chars_per_token)
     covered_ids: list[str] = []
     if pinned and tail_tokens > config.keep_recent_tokens:
-        covered_ids = [str(entry["event_id"]) for entry in tail
+        covered_ids = [str(entry["event_id"]) for entry in pinned
                        if entry.get("event_id")]
         pinned = []
         prefix = entries
-    if not prefix and not covered_ids:
-        # 没有可压缩的已处理内容，尾部又不大：无事可做（避免写空检查点）
-        return None
-    work_entries = prefix if not covered_ids else entries
 
-    # 两步独立并行：记忆提取 + 摘要（两者互不依赖；都完成后压缩结束）。
+    # B ＝ 最近若干整轮（usage 增量挑选 + 字符预算裁剪，超预算的整轮退回 A）
+    # ＋ 未消费尾部；A ＝ prefix 去掉 B 的部分（唯一会被摘要替换的旧内容）。
+    recent = keep_recent_by_usage_diff(prefix, config.keep_recent_tokens)
+    recent_budget_chars = int(config.keep_recent_tokens
+                              * max(1.0, config.estimate_chars_per_token))
+    recent = _trim_recent_by_chars(recent, recent_budget_chars)
+    a_entries = prefix[:len(prefix) - len(recent)]
+    kept = list(recent) + list(pinned)
+    if not a_entries and not covered_ids:
+        # 整个上下文都在 keep_recent 窗口内：没有「更早的 A」可压缩，
+        # 摘要 + 原样保留不会降低体积——跳过（避免写空检查点）。
+        logger.info("compression skipped: nothing older than the kept "
+                    "recent window")
+        return None
+    archive = context.copy_archive(config.compressed_dir)
+
+    # 两步独立并行：记忆提取（只看 A）＋摘要（看整段上下文 A+B）。
     # 提取失败不阻断；摘要重试耗尽时 fallback 结构化 checkpoint。
     async def run_extract() -> None:
-        if config.memory and config.memory.enabled:
+        if config.memory and config.memory.enabled and a_entries:
             await _with_retry(
                 "memory extraction",
-                lambda: extract_memory(llm, work_entries, config.memory,
+                lambda: extract_memory(llm, a_entries, config.memory,
                                        config.max_input_chars,
                                        memory_root=memory_root))
 
     async def run_summarize() -> Optional[str]:
         return await _with_retry(
             "summarize",
-            lambda: summarize(llm, work_entries,
+            lambda: summarize(llm, a_entries,
                               config.summary_prompt_file,
                               config.max_input_chars))
 
-    recent = keep_recent_by_usage_diff(prefix, config.keep_recent_tokens)
     summary = (await asyncio.gather(
         run_summarize(), run_extract()))[0]
+    kept_ids = {str(entry.get("event_id")) for entry in kept
+                if entry.get("event_id")}
+    covered = [i for i in covered_ids if str(i) not in kept_ids]
     if summary is None:
         # 重试耗尽：结构化 fallback checkpoint（不依赖 LLM 摘要）
         checkpoint = build_fallback_checkpoint(
-            work_entries, recent, total, config.max_input_chars,
-            covered_event_ids=covered_ids)
+            entries, total, covered_event_ids=covered)
         logger.warning("summarize exhausted; fallback checkpoint used")
     else:
         checkpoint = build_checkpoint_message(
-            summary, recent, total, config.max_input_chars,
-            covered_event_ids=covered_ids,
+            summary, total, covered_event_ids=covered,
             model=str(getattr(llm, "model", "") or ""))
     # 归档是副本 + 原子写：这里失败原 context 仍完好，无需恢复逻辑。
-    # 未消费尾部（pinned）原样保留在检查点之后：结构化、带 event_id，
-    # _build_messages 按 id 去重后不会重复附加。
-    context.write_all([checkpoint] + pinned)
-    logger.info("context compressed: archive=%s recent=%d/%d pinned=%d "
-                "covered=%d", archive, len(recent), len(entries),
-                len(pinned), len(covered_ids))
+    # 重写为：checkpoint（整段摘要）+ B 原样条目（recent + 未消费尾部）。
+    context.write_all([checkpoint] + kept)
+    logger.info("context compressed: archive=%s summary_of=%d A=%d kept=%d "
+                "covered=%d", archive, len(entries), len(a_entries),
+                len(kept), len(covered))
     return summary
+
+
+def _trim_recent_by_chars(recent: list[dict], max_chars: int) -> list[dict]:
+    """Keep the newest WHOLE rounds whose raw content fits ``max_chars``.
+
+    ``keep_recent`` already starts at a round boundary (a ``role=user``
+    entry). A round whose content alone exceeds the budget is NOT kept
+    (same spirit as the usage-delta budget) — it falls back into A and is
+    covered by the summary, so a huge post-usage tool result can never
+    keep the rewritten context above the trigger line."""
+    if not recent or max_chars <= 0:
+        return list(recent)
+    starts = [i for i, e in enumerate(recent) if e.get("role") == "user"]
+    if not starts or starts[0] != 0:
+        starts = [0] + starts
+    segments: list[list[dict]] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(recent)
+        segments.append(recent[start:end])
+    kept: list[dict] = []
+    total = 0
+    for segment in reversed(segments):
+        size = sum(len(text_of(e.get("content") or "")) for e in segment)
+        if total + size > max_chars:
+            break
+        total += size
+        kept = segment + kept
+    return kept
