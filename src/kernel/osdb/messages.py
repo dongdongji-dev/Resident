@@ -210,16 +210,26 @@ class MessagesStore:
             tuple(params) + (int(limit),))
         return [message_to_dict(row) for row in rows]
 
-    def pending(self, limit: int = 500, window_hours: float = 0,
-                max_per_session: int = 0) -> list[dict[str, Any]]:
-        """Unread in-bound messages (the wake-up source set).
+    @staticmethod
+    def _session_filters(include_sessions, exclude_sessions,
+                         clauses: list[str], params: list[Any]) -> None:
+        """会话级过滤（platform:conversation_id）——必须在 LIMIT 之前
+        生效，否则被屏蔽/无关会话的积压会挤占名额（专注白/黑名单曾因此
+        让最新的私聊推送被 500 条群积压挡掉）。"""
+        if include_sessions:
+            values = [str(s) for s in include_sessions]
+            clauses.append("(platform || ':' || conversation_id) IN ("
+                           + ",".join("?" * len(values)) + ")")
+            params.extend(values)
+        if exclude_sessions:
+            values = [str(s) for s in exclude_sessions]
+            clauses.append("(platform || ':' || conversation_id) NOT IN ("
+                           + ",".join("?" * len(values)) + ")")
+            params.extend(values)
 
-        ``window_hours`` > 0: older unread is TREATED AS READ (excluded) —
-        it neither wakes nor is counted. ``max_per_session`` > 0: per
-        conversation, only the newest N unread count (older ones treated
-        as read). Urgent (wakeup=1) messages are NOT filtered by the window
-        (they must not wait); the session cap still applies to them.
-        """
+    def _pending_where(self, window_hours: float, urgent_only: bool,
+                       include_sessions, exclude_sessions,
+                       ) -> tuple[str, list[Any]]:
         clauses = ["sent_to_llm = 0", "direction = 'in'"]
         params: list[Any] = []
         if window_hours > 0:
@@ -228,21 +238,73 @@ class MessagesStore:
                 .strftime("%Y-%m-%d %H:%M:%S")
             clauses.append("(created_at >= ? OR wakeup = 1)")
             params.append(cutoff)
-        where = " AND ".join(clauses)
+        self._session_filters(include_sessions, exclude_sessions,
+                              clauses, params)
+        if urgent_only:
+            clauses.append("wakeup = 1")
+        return " AND ".join(clauses), params
+
+    def pending(self, limit: int = 500, window_hours: float = 0,
+                max_per_session: int = 0,
+                include_sessions: Optional[list[str]] = None,
+                exclude_sessions: Optional[list[str]] = None,
+                urgent_only: bool = False) -> list[dict[str, Any]]:
+        """Unread in-bound messages (the wake-up source set), NEWEST FIRST.
+
+        Newest-first matters: the LIMIT must keep the freshest unread, so a
+        large old backlog can never hide a just-arrived message (a private
+        message used to be invisible behind 500 older group messages).
+
+        ``window_hours`` > 0: older unread is TREATED AS READ (excluded) —
+        it neither wakes nor is counted. ``max_per_session`` > 0: per
+        conversation, only the newest N unread count (older ones treated
+        as read). ``include_sessions`` / ``exclude_sessions`` filter by
+        ``platform:conversation_id`` BEFORE the limit (focus whitelist /
+        blacklist). ``urgent_only`` keeps only wakeup=1 (the urgent wake
+        decision must not be starved by a backlog). Urgent messages are NOT
+        filtered by the window; the session cap still applies to them.
+        """
+        where, params = self._pending_where(
+            window_hours, urgent_only, include_sessions, exclude_sessions)
         if max_per_session > 0:
             # 每会话取最新 N 条（更早的视为已读）
             rows = self._db.query(
                 "SELECT * FROM (SELECT " + ", ".join(MESSAGE_COLUMNS) + ","
                 " ROW_NUMBER() OVER (PARTITION BY platform, conversation_id"
                 " ORDER BY seq DESC) AS rn FROM messages WHERE " + where
-                + ") WHERE rn <= ? ORDER BY seq LIMIT ?",
+                + ") WHERE rn <= ? ORDER BY seq DESC LIMIT ?",
                 tuple(params) + (int(max_per_session), int(limit)))
             return [message_to_dict(row) for row in rows]
         rows = self._db.query(
             "SELECT " + ", ".join(MESSAGE_COLUMNS)
             + " FROM messages WHERE " + where
-            + " ORDER BY seq LIMIT ?", tuple(params) + (int(limit),))
+            + " ORDER BY seq DESC LIMIT ?", tuple(params) + (int(limit),))
         return [message_to_dict(row) for row in rows]
+
+    def unread_counts(self, window_hours: float = 0,
+                      max_per_session: int = 0,
+                      include_sessions: Optional[list[str]] = None,
+                      exclude_sessions: Optional[list[str]] = None,
+                      ) -> dict[str, int]:
+        """Per-session unread in-bound counts (same window/cap semantics as
+        ``pending``), for the focus filter digest — counts only, no content."""
+        where, params = self._pending_where(
+            window_hours, False, include_sessions, exclude_sessions)
+        expr = "(platform || ':' || conversation_id)"
+        if max_per_session > 0:
+            rows = self._db.query(
+                "SELECT session, COUNT(*) AS n FROM ("
+                "SELECT " + expr + " AS session, ROW_NUMBER() OVER ("
+                "PARTITION BY platform, conversation_id ORDER BY seq DESC)"
+                " AS rn FROM messages WHERE " + where
+                + ") WHERE rn <= ? GROUP BY session",
+                tuple(params) + (int(max_per_session),))
+        else:
+            rows = self._db.query(
+                "SELECT " + expr + " AS session, COUNT(*) AS n"
+                " FROM messages WHERE " + where + " GROUP BY session",
+                tuple(params))
+        return {str(row["session"]): int(row["n"]) for row in rows}
 
     def unread_count(self, platform: str = "",
                      conversation_id: str = "") -> int:

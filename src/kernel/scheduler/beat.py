@@ -354,22 +354,9 @@ class Beat:
             return session in focus_filter["sessions"]
         return session not in focus_filter["sessions"]
 
-    def _partition_by_filter(
-            self, messages: list[dict[str, Any]],
-            focus_filter: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        passing: list[dict[str, Any]] = []
-        muted: list[dict[str, Any]] = []
-        for message in messages:
-            target = (passing
-                      if self._session_passes_filter(message,
-                                                     focus_filter)
-                      else muted)
-            target.append(message)
-        return passing, muted
-
     def _focus_block(self, focus_filter: dict[str, Any],
-                     muted: list[dict[str, Any]]) -> str:
+                     muted_total: int,
+                     muted_counts: dict[str, int]) -> str:
         """筛选模式随醒信息块：名单内容 + 被筛除未读计数（不展开
         内容）+ 到期时间。"""
         until = focus_until(self._system_vars)
@@ -381,15 +368,12 @@ class Beat:
         else:
             head = ("当前处于专注筛选模式（黑名单）："
                     f"以下会话暂不推送内容——{listed}")
-        counts: dict[str, int] = {}
-        for message in muted:
-            session = _session_of(message)
-            counts[session] = counts.get(session, 0) + 1
-        if counts:
+        if muted_counts:
             detail = "；".join(
                 f"{session} {count} 条" for session, count in
-                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
-            hidden = (f"；被筛除消息共 {len(muted)} 条未读"
+                sorted(muted_counts.items(),
+                       key=lambda kv: (-kv[1], kv[0])))
+            hidden = (f"；被筛除消息共 {muted_total} 条未读"
                       f"（{detail}），仅计数、不展开内容")
         else:
             hidden = "；当前没有被筛除的未读消息"
@@ -472,35 +456,37 @@ class Beat:
     def _maybe_awake(self,
                      focus_filter: Optional[dict[str, Any]] = None) -> None:
         """Wake-decision chain (``focus_filter`` narrows the eligible
-        messages to whitelisted / non-blacklisted sessions; everything
-        else is condensed to unread counts):
+        messages to whitelisted / non-blacklisted sessions — the filter is
+        pushed into SQL so a muted backlog can never consume the LIMIT and
+        hide new messages; everything filtered out is condensed to counted
+        unread):
 
         1. urgent wake: unread messages marked wakeup=1 exist → fire
-           immediately WITHOUT probability check;
+           immediately WITHOUT probability check (urgent is queried on its
+           own, so an ordinary backlog cannot hide it);
         2. wake-dedup cooldown window active → skip the general channel;
         3. agent busy → skip;
         4. otherwise effective probability roll
            (``p * e^(unread_weight * unread)`` capped 1.0) → general wake.
         """
-        pending_all = self._messages.pending()
-        muted_all: list[dict[str, Any]] = []
-        if focus_filter is not None:
-            pending_all, muted_all = self._partition_by_filter(
-                pending_all, focus_filter)
-        urgent = [m for m in pending_all if m["wakeup"]]
+        session_kw = self._focus_session_kw(focus_filter)
+        # 紧急分支：单独查 wakeup=1（不受普通积压 / LIMIT 500 截断影响）
+        urgent = self._messages.pending(urgent_only=True, **session_kw)
         if urgent:
-            # 紧急消息不受窗口限制（必须及时处理）；会话上限仍适用
-            self._fire_wake(pending_all, urgent_messages=urgent,
-                            focus_filter=focus_filter, muted=muted_all)
+            # 紧急消息不受窗口限制（必须及时处理）；会话上限仍适用。
+            # 载荷仍带全部未读（受会话过滤），用于最早/最新结构。
+            muted_total, muted_counts = self._muted_stats(focus_filter)
+            self._fire_wake(self._messages.pending(**session_kw),
+                            urgent_messages=urgent,
+                            focus_filter=focus_filter,
+                            muted_total=muted_total,
+                            muted_counts=muted_counts)
             return
         # 普通唤醒：窗口外/超上限的未读视为已读（不携带不统计）
         pending = self._messages.pending(
             window_hours=self._config.unread_window_hours,
-            max_per_session=self._config.unread_max_per_session)
-        muted: list[dict[str, Any]] = []
-        if focus_filter is not None:
-            pending, muted = self._partition_by_filter(pending,
-                                                       focus_filter)
+            max_per_session=self._config.unread_max_per_session,
+            **session_kw)
         if (self._config.wake_dedup
                 and self._config.wake_cooldown_seconds > 0):
             if time.time() - self._last_wake_at \
@@ -517,13 +503,48 @@ class Beat:
             return
         logger.info("proactive awake hit p=%.6f unread=%d effective=%.6f",
                     base, len(pending), effective)
+        muted_total, muted_counts = self._muted_stats(focus_filter)
         self._fire_wake(pending, urgent_messages=[],
-                        focus_filter=focus_filter, muted=muted)
+                        focus_filter=focus_filter,
+                        muted_total=muted_total,
+                        muted_counts=muted_counts)
+
+    @staticmethod
+    def _focus_session_kw(focus_filter: Optional[dict[str, Any]]
+                          ) -> dict[str, Any]:
+        """SQL 会话过滤参数：白名单→include，黑名单→exclude。"""
+        if focus_filter is None:
+            return {}
+        sessions = sorted(focus_filter["sessions"])
+        if focus_filter["mode"] == "whitelist":
+            return {"include_sessions": sessions}
+        return {"exclude_sessions": sessions}
+
+    def _muted_stats(self, focus_filter: Optional[dict[str, Any]]
+                     ) -> tuple[int, dict[str, int]]:
+        """被筛除会话的未读统计（只计数，不展开内容）。"""
+        if focus_filter is None:
+            return 0, {}
+        session_kw = self._focus_session_kw(focus_filter)
+        if "include_sessions" in session_kw:
+            session_kw = {"exclude_sessions": session_kw["include_sessions"]}
+        else:
+            session_kw = {"include_sessions": session_kw["exclude_sessions"]}
+        try:
+            counts = self._messages.unread_counts(
+                window_hours=self._config.unread_window_hours,
+                max_per_session=self._config.unread_max_per_session,
+                **session_kw)
+        except Exception:  # noqa: BLE001 — 统计失败不影响唤醒
+            logger.exception("focus muted stats failed")
+            return 0, {}
+        return sum(counts.values()), counts
 
     def _fire_wake(self, pending: list[dict[str, Any]],
                    urgent_messages: list[dict[str, Any]],
                    focus_filter: Optional[dict[str, Any]] = None,
-                   muted: Optional[list[dict[str, Any]]] = None) -> None:
+                   muted_total: int = 0,
+                   muted_counts: Optional[dict[str, int]] = None) -> None:
         """Assemble the wake payload and write it as a notice (the single
         channel to the Agent). Carried messages are marked read; urgent
         messages are demoted (wakeup=0) after display; the probability is
@@ -540,7 +561,8 @@ class Beat:
         # 筛选块只在队列中没有副本时附带：同一批内的补充通知不重复写
         focus_block = ""
         if focus_filter is not None and not self._focus_block_queued():
-            focus_block = self._focus_block(focus_filter, muted or [])
+            focus_block = self._focus_block(focus_filter, muted_total,
+                                            muted_counts or {})
         todo_block = self._todo_block(urgent_messages)
         now = now_str()
         # 唤醒冷却：概率降到下限；记录唤醒时间（dedup 门闩）
