@@ -28,6 +28,7 @@ Cycle (per spec):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -37,9 +38,16 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 from kernel.agent_framework.compression import (CompressionConfig,
-                                                compress_context,
+                                                PreparedCompression,
+                                                apply_prepared,
+                                                delete_prepared,
+                                                is_prepared_valid,
+                                                load_prepared,
                                                 load_reminder_prompt,
-                                                render_reminder)
+                                                prepare_compression,
+                                                render_reminder,
+                                                run_memory_extraction,
+                                                save_prepared)
 from kernel.agent_framework.content import (content_bytes, content_preview,
                                             has_image, strip_images)
 from kernel.agent_framework.context import ContextStore
@@ -120,6 +128,19 @@ class Agent:
         self.observer = observer
         self.compression = compression  # Optional[CompressionConfig]
         self.compression_llm = compression_llm  # 独立压缩模型；None 回退主 llm
+        # 预压缩（体验优化）：到提前量后台先跑摘要，触发线直接替换/轮询。
+        self._prep_task: Optional[asyncio.Task] = None
+        self._prep_result: Optional[PreparedCompression] = None
+        self._prep_error: Optional[BaseException] = None
+        # 本预压缩任务启动的记忆提取（失败回退时复用它，避免同一 A 重复请求）
+        self._prep_memory_task: Optional[asyncio.Task] = None
+        # 已替换、等待记忆提取/提醒的压缩（状态持久化在磁盘上）
+        self._active_prepared: Optional[PreparedCompression] = None
+        # 压缩后的记忆提取（非阻塞；完成后推整理提醒）
+        self._memory_task: Optional[asyncio.Task] = None
+        # 上次压缩完成时最新 usage 条目的指纹：在出现新的 provider usage 之前
+        # 旧 usage 已失效，触发判断改用纯内容估算（避免压缩完立刻再压一次）。
+        self._compressed_usage_key: Optional[str] = None
         self.notices = notices  # Optional[NoticeStore]
         self.llm_failed_backoff_seconds = float(llm_failed_backoff_seconds)
         # 永久性 LLM 故障隔离：连续 threshold 次 LLMPermanentError（0=关闭）
@@ -236,6 +257,11 @@ class Agent:
         logger.info("agent run started")
         self._set_state(AgentState.IDLE)
         try:
+            # 重启后内存里的预压缩任务已丢失：先复用磁盘上已完成的摘要/
+            # 记忆提取（同一 A 不重复计费），再按水平触发重建
+            if self.compression is not None:
+                self._recover_prepared()
+                await self._maybe_compress()
             while not self._stop.is_set():
                 if restart_pending():
                     # 重启信号：干净退出 run 循环，由 main() 负责重启
@@ -694,12 +720,49 @@ class Agent:
         logger.info("compression force-requested (system_vars)")
         return True
 
+    @staticmethod
+    def _newest_usage_key(entries: list[dict]) -> Optional[str]:
+        """Fingerprint of the newest entry carrying provider usage (None
+        when there is none)."""
+        for entry in reversed(entries):
+            usage = entry.get("usage")
+            if isinstance(usage, dict) and usage.get("total_tokens"):
+                payload = json.dumps(entry, ensure_ascii=False,
+                                     sort_keys=True, default=str)
+                return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return None
+
+    def _current_total(self) -> int:
+        """Trigger footprint. Right after a compression the newest provider
+        usage still describes the PRE-compression context; while no NEW
+        usage has arrived, estimate from content only so the same compression
+        is not requested a second time (billing!)."""
+        entries = self.context.load()
+        if (self._compressed_usage_key is not None
+                and self._newest_usage_key(entries)
+                == self._compressed_usage_key):
+            return self.context.content_tokens(
+                self.compression.estimate_chars_per_token,
+                self.compression.image_tokens_estimate)
+        return self.context.estimated_tokens(
+            self.compression.estimate_chars_per_token,
+            self.compression.image_tokens_estimate)
+
     async def _maybe_compress(self) -> None:
-        """Two-step compression (remember extraction + summary/keep-recent)
-        once the accumulated tokens exceed ``max_tokens * threshold`` — or
-        immediately when ``compress_requested`` is set in system_vars.
-        On success a notice is created so the Agent learns the context was
-        compacted (delivered by the Beat like every other notice).
+        """Compression at safe points, with background precompression.
+
+        - Below the trigger line: once the context also passes
+          ``trigger - keep_recent_tokens``, start the summary in the
+          BACKGROUND (exactly the same prepared output the blocking path
+          would produce). Nothing is written, the state stays untouched.
+        - At/above the trigger line: apply the prepared summary instantly if
+          ready; if it is still running enter COMPRESS and poll until it
+          finishes; if it failed, fall back to the synchronous path (error
+          logged).
+        - ``compress_requested`` (manual tool / byte-budget relief) always
+          uses the synchronous chain and discards any prepared job.
+        Memory extraction runs AFTER the swap (never delays the resume) and
+        then pushes the organize-memory reminder (compression_reminder.md).
         NOT triggered -> returns WITHOUT touching the state (callers may
         invoke this mid-round as a pre-check; only an actual compression
         transitions COMPRESS -> IDLE)."""
@@ -716,62 +779,338 @@ class Agent:
         force = self._consume_compress_request()
         # 估算 = 最新 provider usage + 其后追加条目的内容估算（usage 落后
         # 于尾部工具结果，单靠它会让超长上下文永远触发不了压缩）
-        total = self.context.estimated_tokens(
-            self.compression.estimate_chars_per_token,
-            self.compression.image_tokens_estimate)
-        if not force and total <= self.compression.max_tokens \
-                * self.compression.threshold:
-            # 未触发：不动状态（预压缩调用点在轮中，状态由调用方维持）
+        total = self._current_total()
+        hard = self.compression.max_tokens * self.compression.threshold
+        # 水平触发 + 幂等：只要越过 A 点就确保有一个后台预压缩任务
+        # （kernel 随时可能被 stop，重启后靠这里自动重建；最多只跑一个）。
+        # 只有到 A+B（触发线）才替换。
+        if not force:
+            self._maybe_precompress(total, hard)
+        if not force and total <= hard:
             return
         self._set_state(AgentState.COMPRESS)
         try:
-            workspace = getattr(self, "workspace", None)
-            summary = await compress_context(
-                self.context, self.compression_llm or self.llm,
-                self.compression, force=force,
-                memory_root=(workspace.host_root if workspace else ""))
-            if summary is not None:
-                self._publish({"type": "context_compressed",
-                               "summary": summary})
-                # 压缩完成：把整理提醒作为 user 消息【立即入队触发下一轮】，
-                # 而不是等 beat 定时 flush——否则压缩完直接 idle 发呆。
-                # 提醒模板来自 compression.reminder_file（{memory_file} 占位符）
-                try:
-                    memory_file = ""
-                    if (self.compression.memory
-                            and self.compression.memory.enabled):
-                        memory_file = self.compression.memory.file
-                        resolved = ""
-                        if self.runtime_path is not None:
-                            try:
-                                resolved = self.runtime_path(memory_file)
-                            except Exception:  # noqa: BLE001
-                                resolved = ""
-                        if not resolved:
-                            workspace = getattr(self, "workspace", None)
-                            if workspace is not None:
-                                try:
-                                    resolved = workspace.to_container(
-                                        memory_file)
-                                except Exception:  # noqa: BLE001
-                                    resolved = ""
-                        if resolved:
-                            memory_file = resolved
-                    reminder = render_reminder(
-                        load_reminder_prompt(self.compression.reminder_file),
-                        memory_file)
-                    self.push_event({
-                        "role": "user",
-                        "content": reminder,
-                        "kind": "notice",
-                        "source": "runtime",
-                    })
-                    logger.info("compression reminder pushed to agent")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("compression reminder push failed: %s",
-                                   exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("compression failed: %s", exc)
-            self._publish({"type": "compression_failed", "error": str(exc)})
+            await self._compress_now(total=total, force=force)
         finally:
             self._set_state(AgentState.IDLE)
+
+    def _maybe_precompress(self, total: int, hard: float) -> None:
+        """LEVEL-triggered precompression: as long as the context is above
+        the A point (``trigger - keep_recent_tokens``) make sure one
+        background summary exists (idempotent: at most one; recreated after
+        a kernel restart, where the in-memory job was lost).
+
+        Below ``A+B`` the whole snapshot is A (``preemptive``). At/above the
+        trigger line (e.g. restart happened past the line) the blocking
+        split is used so the newest ``keep_recent_tokens`` (B) stays raw."""
+        if not self.compression.precompress:
+            return
+        early = hard - self.compression.keep_recent_tokens
+        if total <= early:
+            return
+        if (self._prep_task is not None or self._prep_result is not None
+                or self._prep_error is not None):
+            return
+        entries = self.context.load()
+        if not entries:
+            return
+        last = entries[-1]
+        if last.get("role") == "assistant" and last.get("tool_calls"):
+            # 工具结果尚未落盘：此刻切分会把配对拆开，等下一安全点
+            return
+        preemptive = total < hard
+        logger.info("precompression started: tokens=%d > early(%.0f); "
+                    "mode=%s", total, early,
+                    "speculative" if preemptive else "blocking-split")
+        self._prep_task = asyncio.create_task(
+            self._prepare_job(total, preemptive))
+
+    async def _prepare_job(self, total: int, preemptive: bool) -> None:
+        runner = self._memory_runner()
+        if runner is not None:
+            def start_memory(entries: list[dict]):
+                self._prep_memory_task = runner(entries)
+                return self._prep_memory_task
+        else:
+            start_memory = None
+        try:
+            prepared = await prepare_compression(
+                self.context, self.compression_llm or self.llm,
+                self.compression, total=total, preemptive=preemptive,
+                memory_runner=start_memory)
+            self._prep_result = prepared
+            if prepared is None:
+                logger.info("precompression skipped: nothing compressible")
+            else:
+                self._track_memory_task(prepared)
+                self._save_prepared_state(prepared)
+                logger.info("precompression ready: A=%d kept=%d summary=%s",
+                            len(prepared.a_entries),
+                            prepared.snapshot_len - prepared.split_index,
+                            prepared.summary is not None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._prep_error = exc
+            logger.error("precompression failed: %s", exc)
+
+    async def _wait_precompression(self) -> Optional[PreparedCompression]:
+        """Poll the background summary until it is done (COMPRESS state)."""
+        task = self._prep_task
+        poll = max(0.05, float(self.compression.precompress_poll_seconds))
+        logger.info("waiting for precompressed summary (poll=%.2fs)", poll)
+        ticks = 0
+        while task is not None and not task.done():
+            await asyncio.sleep(poll)
+            ticks += 1
+            if ticks % 10 == 0:
+                logger.info("still waiting for precompressed summary: %.0fs",
+                            ticks * poll)
+        if self._prep_error is not None:
+            logger.error("precompression failed while waiting; falling back "
+                         "to synchronous compression: %s", self._prep_error)
+            return None
+        return self._prep_result
+
+    def _clear_prepared(self) -> None:
+        self._prep_task = None
+        self._prep_result = None
+        self._prep_error = None
+        self._prep_memory_task = None
+
+    async def _compress_now(self, total: int, force: bool) -> None:
+        """Apply an existing prepared result whenever there is one — ready,
+        still running, or failed-but-with-memory-extraction-alive. The SAME
+        snapshot is never requested twice (not even by a manual force
+        trigger); a fresh request happens only when no usable result exists
+        (or the result turned out stale)."""
+        prepared: Optional[PreparedCompression] = None
+        if self._prep_task is not None:
+            prepared = await self._wait_precompression()
+        elif self._prep_result is not None:
+            prepared = self._prep_result
+        elif self._prep_error is not None:
+            logger.error("precompression failed earlier; falling back to "
+                         "synchronous compression: %s", self._prep_error)
+        # 同一 A 的记忆提取只请求一次：任务已启动（即使摘要失败/结果过期）
+        # 就复用它，绝不重新发起
+        reuse_memory = (prepared.memory_task if prepared is not None
+                        else self._prep_memory_task)
+        self._clear_prepared()
+        applied = False
+        if prepared is not None:
+            applied = apply_prepared(self.context, prepared)
+            if not applied:
+                logger.warning("precompressed result is stale; running "
+                               "synchronous compression")
+        if not applied:
+            try:
+                prepared = await prepare_compression(
+                    self.context, self.compression_llm or self.llm,
+                    self.compression, force=force, total=total,
+                    memory_runner=(None if reuse_memory
+                                   else self._memory_runner()))
+                if prepared is None:
+                    return
+                if reuse_memory is not None:
+                    prepared.memory_task = reuse_memory
+                    self._track_memory_task(prepared, reuse_memory)
+                else:
+                    self._track_memory_task(prepared)
+                self._save_prepared_state(prepared)
+                applied = apply_prepared(self.context, prepared)
+                if not applied:
+                    logger.warning("compression result stale right after "
+                                   "prepare")
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.error("compression failed: %s", exc)
+                self._publish({"type": "compression_failed",
+                               "error": str(exc)})
+                return
+        if prepared is not None:
+            self._on_compressed(prepared)
+
+    def _on_compressed(self, prepared: PreparedCompression) -> None:
+        self._compressed_usage_key = self._newest_usage_key(
+            self.context.load())
+        prepared.applied = True
+        self._active_prepared = prepared
+        self._save_prepared_state(prepared)
+        if prepared.summary is not None:
+            self._publish({"type": "context_compressed",
+                           "summary": prepared.summary})
+        else:
+            logger.warning("context compressed with a fallback checkpoint "
+                           "(summary unavailable)")
+        self._schedule_post_compression(prepared)
+
+    def _memory_runner(self):
+        """Return a callable that starts memory extraction CONCURRENTLY with
+        the summary (same A), or None when memory extraction is disabled.
+        The task is tracked on the agent; it is never awaited by compression."""
+        memory = self.compression.memory
+        if memory is None or not memory.enabled:
+            return None
+
+        def start(entries: list[dict]):
+            workspace = getattr(self, "workspace", None)
+            self._memory_task = asyncio.create_task(
+                run_memory_extraction(
+                    self.compression_llm or self.llm, entries, memory,
+                    self.compression.max_input_chars,
+                    memory_root=(workspace.host_root if workspace else "")))
+            return self._memory_task
+
+        return start
+
+    @staticmethod
+    def _task_text(task: asyncio.Task) -> Optional[str]:
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            return None
+        except Exception:  # noqa: BLE001 — 结果已在任务内记录
+            return None
+
+    def _track_memory_task(self, prepared: PreparedCompression,
+                           task: Optional[asyncio.Task] = None) -> None:
+        """Record the memory result on the prepared object (and on disk) the
+        moment it finishes — even before the swap, so a restart can reuse
+        the success instead of requesting the same A again."""
+        task = task if task is not None else prepared.memory_task
+        if task is None:
+            return
+        prepared.memory_task = task
+        task.add_done_callback(
+            lambda done, p=prepared: self._memory_task_recorded(p, done))
+
+    def _memory_task_recorded(self, prepared: PreparedCompression,
+                              task: asyncio.Task) -> None:
+        text = self._task_text(task)
+        prepared.memory_status = "failed" if text is None else "done"
+        prepared.memory_wrote = bool(text)
+        if text is None:
+            logger.error("memory extraction failed after retries; the "
+                         "reminder omits the archive note")
+        self._save_prepared_state(prepared)
+
+    def _save_prepared_state(self, prepared: PreparedCompression) -> None:
+        if self.compression is None or prepared.notice_pushed:
+            return
+        current = load_prepared(self.compression)
+        if current is not None and current.job_id != prepared.job_id:
+            return  # 更新的预压缩结果已落盘，不覆盖
+        save_prepared(self.compression, prepared)
+
+    def _delete_prepared_state(self, prepared: PreparedCompression) -> None:
+        if self.compression is None:
+            return
+        current = load_prepared(self.compression)
+        if current is not None and current.job_id != prepared.job_id:
+            return  # 别删掉更新的预压缩结果
+        delete_prepared(self.compression)
+
+    def _recover_prepared(self) -> None:
+        """Startup: reuse a persisted prepared summary (no request) and
+        finish any interrupted memory/reminder state."""
+        if self.compression is None:
+            return
+        prepared = load_prepared(self.compression)
+        if prepared is None:
+            return
+        if prepared.applied:
+            self._compressed_usage_key = self._newest_usage_key(
+                self.context.load())
+            self._active_prepared = prepared
+            logger.info("recovered applied compression state from disk "
+                        "(memory=%s)", prepared.memory_status)
+            self._schedule_post_compression(prepared)
+            return
+        if is_prepared_valid(self.context.load(), prepared):
+            self._prep_result = prepared
+            logger.info("recovered prepared compression from disk "
+                        "(summary reused, no request)")
+        else:
+            logger.info("prepared state does not match the context; dropped")
+            delete_prepared(self.compression)
+
+    def _schedule_post_compression(self, prepared: PreparedCompression) -> None:
+        """The swap already happened (only the summary was awaited). Push the
+        organize-memory reminder once the CONCURRENTLY started memory
+        extraction finishes — immediately when it is already done. A loaded
+        (restart) state with a pending extraction resumes it."""
+        task = prepared.memory_task
+        memory = self.compression.memory
+        if (task is None and memory is not None and memory.enabled
+                and prepared.a_entries
+                and prepared.memory_status == "pending"):
+            runner = self._memory_runner()
+            if runner is not None:
+                task = runner(prepared.a_entries)
+                self._track_memory_task(prepared, task)
+                self._save_prepared_state(prepared)
+        if task is None:
+            self._push_compression_reminder(
+                memory.file if (memory is not None
+                                and prepared.memory_wrote) else "",
+                prepared)
+            return
+        self._memory_task = task
+        if task.done():
+            self._memory_finished(task, prepared)
+        else:
+            task.add_done_callback(
+                lambda done, p=prepared: self._memory_finished(done, p))
+
+    def _memory_finished(self, task: asyncio.Task,
+                         prepared: PreparedCompression) -> None:
+        """Memory extraction finished (success/failure): push the reminder
+        (without the archive path when nothing was appended) and clean the
+        persisted state."""
+        text = self._task_text(task)
+        memory = self.compression.memory
+        self._push_compression_reminder(
+            memory.file if (text and memory is not None) else "",
+            prepared)
+
+    def _push_compression_reminder(self, memory_file: str = "",
+                                   prepared: Optional[
+                                       PreparedCompression] = None) -> None:
+        """Push the organize-memory reminder (compression_reminder.md) as a
+        user notice; the memory file path is only included when the
+        extraction actually appended something. When ``prepared`` is given,
+        its persisted state is cleaned up afterwards."""
+        try:
+            resolved = memory_file  # 兜底：至少给出配置里的路径
+            if memory_file and self.runtime_path is not None:
+                try:
+                    resolved = self.runtime_path(memory_file) or resolved
+                except Exception:  # noqa: BLE001
+                    pass
+            if memory_file and self.runtime_path is None:
+                workspace = getattr(self, "workspace", None)
+                if workspace is not None:
+                    try:
+                        resolved = workspace.to_container(memory_file) \
+                            or resolved
+                    except Exception:  # noqa: BLE001
+                        pass
+            reminder = render_reminder(
+                load_reminder_prompt(self.compression.reminder_file),
+                resolved)
+            self.push_event({
+                "role": "user",
+                "content": reminder,
+                "kind": "notice",
+                "source": "runtime",
+            })
+            logger.info("compression reminder pushed to agent")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compression reminder push failed: %s", exc)
+        finally:
+            if prepared is not None:
+                prepared.notice_pushed = True
+                self._delete_prepared_state(prepared)
+                if self._active_prepared is prepared:
+                    self._active_prepared = None

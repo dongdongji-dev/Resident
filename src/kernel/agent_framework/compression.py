@@ -1,21 +1,28 @@
-"""Two-step context compression (ported from the old project, simplified).
+"""Context compression (summary is the only blocking step).
 
-Step 1 — memory extraction:
-  a tool-less LLM call summarizes EVERY noteworthy fact in the context. Its
-  FIRST output is appended VERBATIM to ``workspace/memory/need_archive.md``
-  (no platform classification — content may be mixed, the model untangles it
-  later). Blocks are append-only with a ``-----`` separator plus the
-  compression-trigger time at the head.
-
-Step 2 — whole-context summary + raw recent window:
+Step 1 — summary:
   split the processed context into A (older part) and B (the most recent
   WHOLE rounds that just fit under ``keep_recent_tokens``, plus the
-  unconsumed tail). Memory extraction AND the summary both read A only;
-  the jsonl is archived (a copy) and rebuilt as one user checkpoint
-  carrying the summary, followed by B kept VERBATIM (raw entries) — only A
-  is replaced. A raw-kept round bigger than the budget
-  (e.g. a huge tool result appended after the usage snapshot) falls back
-  into A instead of breaking the reduction.
+  unconsumed tail; assistant tool_calls and their results are never split
+  across the boundary). The summary reads A only; the jsonl is archived (a
+  copy) and rebuilt as one user checkpoint carrying the summary, followed by
+  B kept VERBATIM (raw entries) — only A is replaced. A raw-kept round
+  bigger than the budget (e.g. a huge tool result appended after the usage
+  snapshot) falls back into A instead of breaking the reduction.
+
+Step 2 — memory extraction (CONCURRENT with the summary):
+  reads A only and appends its first output verbatim to the memory file.
+  It is started together with the summary (both retried independently,
+  errors logged); the Agent only WAITS for the summary — the swap happens
+  as soon as the checkpoint is ready, and the "organize memory" reminder
+  (``compression_reminder.md``) is pushed when memory extraction finishes.
+
+Precompression (Agent-side): at ``trigger - keep_recent_tokens`` the Agent
+starts step 1 in the BACKGROUND (exactly the same prepared output the
+blocking path would produce); when the trigger line is reached the prepared
+checkpoint is applied instantly (or the Agent polls until it is ready). A
+failed background job falls back to the synchronous path at the trigger
+line.
 
 All parameters come from YAML (``compression:`` section) — no hidden defaults.
 """
@@ -23,8 +30,12 @@ All parameters come from YAML (``compression:`` section) — no hidden defaults.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
 import re
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -67,6 +78,11 @@ class CompressionConfig:
     # 独立压缩 LLM 配置（protocol/base_url/api_key/model/...），None 表示
     # 复用主 agent 的 LLM。见 config/agent.yaml ``compression.llm``。
     llm: Optional[dict] = None
+    # 预压缩：到「触发线 - keep_recent_tokens」时后台先跑摘要（与阻塞
+    # 压缩同一套产物），到触发线再替换。
+    precompress: bool = True
+    # 等待后台摘要时的轮询间隔（秒）。
+    precompress_poll_seconds: float = 1.0
 
 
 def load_compression_config(config: dict) -> Optional[CompressionConfig]:
@@ -105,6 +121,9 @@ def load_compression_config(config: dict) -> Optional[CompressionConfig]:
         max_input_chars=int(section.get("max_input_chars", 200000)),
         memory=memory,
         llm=llm,
+        precompress=bool(section.get("precompress", True)),
+        precompress_poll_seconds=float(
+            section.get("precompress_poll_seconds", 1.0)),
     )
 
 
@@ -433,44 +452,154 @@ async def _with_retry(description: str,
     return None
 
 
-# ── orchestrator ───────────────────────────────────────────────────────
-async def compress_context(context: ContextStore, llm: Any,
-                           config: CompressionConfig,
-                           force: bool = False,
-                           memory_root: str = "") -> Optional[str]:
-    """Run the two-step compression; returns the summary (None when not
-    triggered). ``force=True`` compresses even below the token threshold
-    (e.g. a byte-budget relief requested via os.db system_vars). Step-1/
-    step-2 LLM calls are retried; when summarization ultimately fails, a
-    STRUCTURED fallback checkpoint (previous compaction + system note) is
-    written so the context ALWAYS comes down. The archive is a COPY and the
-    rewrite is atomic, so a crash/kill at any point keeps the active
-    context intact (never archived away without a replacement).
+# ── prepare / apply (background-precompression friendly) ───────────────
+@dataclass
+class PreparedCompression:
+    """A finished summary waiting to be swapped in.
 
-    A = the older part that is replaced by the summary; B = the most recent
-    WHOLE rounds that fit ``keep_recent_tokens`` plus the UNCONSUMED TAIL
-    (entries after the last assistant = the current batch the model has not
-    seen yet). Memory extraction AND the summary both read A ONLY (the
-    part that is replaced); B is kept VERBATIM after the checkpoint with
-    its event_ids, so ``_build_messages`` dedupes instead of re-appending
-    it.
-    An oversized tail is flattened into the summary and its event ids
-    recorded in the checkpoint metadata (``covered_event_ids``); a raw-kept
-    round whose content exceeds the budget falls back into A as well."""
-    total = context.estimated_tokens(
-        config.estimate_chars_per_token, config.image_tokens_estimate)
-    if not force and total <= config.max_tokens * config.threshold:
-        return None
-    entries = context.load()
-    if not entries:
-        return None
-    if force and total <= config.max_tokens * config.threshold:
-        logger.info("forced compression requested (tokens=%d, below "
-                    "threshold)", total)
-    else:
-        logger.info("compression triggered: tokens=%d > %d*%.2f",
-                    total, config.max_tokens, config.threshold)
+    Built from a SNAPSHOT: the first ``split_index`` entries (A) are
+    replaced by ``checkpoint`` while everything after them stays. The
+    context is append-only between prepare and apply, so entries added in
+    the meantime are simply kept; ``snapshot_len`` + ``boundary_key`` detect
+    a rewrite by another compression."""
+    checkpoint: dict
+    a_entries: list[dict]
+    split_index: int
+    snapshot_len: int
+    boundary_key: str
+    covered_event_ids: list[str]
+    summary: Optional[str]
+    tokens_before: int
+    archive: Optional[str]
+    # 与摘要同时启动的记忆提取任务（None = 未启用/没有 A）；Agent 只等摘要，
+    # 该任务完成后才推整理提醒。
+    memory_task: Optional[asyncio.Task] = None
+    # 持久化状态（重启复用；同一 A 成功过就不再请求）
+    job_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    preemptive: bool = False
+    applied: bool = False
+    memory_status: str = "pending"  # pending / done / failed
+    memory_wrote: bool = False
+    notice_pushed: bool = False  # 内存标记：提醒已推、状态文件已清理
 
+
+def _entry_key(entry: dict) -> str:
+    payload = json.dumps(entry, ensure_ascii=False, sort_keys=True,
+                         default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+PREPARED_VERSION = 1
+
+
+def prepared_state_path(config: CompressionConfig) -> Path:
+    """Disk state of the prepared compression (survives kernel restarts)."""
+    return Path(config.compressed_dir) / "prepared.json"
+
+
+def prepared_to_dict(prepared: PreparedCompression) -> dict:
+    return {
+        "version": PREPARED_VERSION,
+        "saved_at": now_str(),
+        "job_id": prepared.job_id,
+        "preemptive": prepared.preemptive,
+        "checkpoint": prepared.checkpoint,
+        "split_index": prepared.split_index,
+        "snapshot_len": prepared.snapshot_len,
+        "boundary_key": prepared.boundary_key,
+        "covered_event_ids": prepared.covered_event_ids,
+        "summary": prepared.summary,
+        "tokens_before": prepared.tokens_before,
+        "archive": prepared.archive,
+        "a_entries": prepared.a_entries,
+        "applied": prepared.applied,
+        "memory_status": prepared.memory_status,
+        "memory_wrote": prepared.memory_wrote,
+    }
+
+
+def save_prepared(config: CompressionConfig,
+                  prepared: PreparedCompression) -> None:
+    path = prepared_state_path(config)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(prepared_to_dict(prepared),
+                                  ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("prepared state save failed: %s", exc)
+
+
+def load_prepared(config: CompressionConfig
+                  ) -> Optional[PreparedCompression]:
+    path = prepared_state_path(config)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.warning("prepared state unreadable (%s); dropping", exc)
+        delete_prepared(config)
+        return None
+    if raw.get("version") != PREPARED_VERSION:
+        logger.warning("prepared state version mismatch; dropping")
+        delete_prepared(config)
+        return None
+    try:
+        return PreparedCompression(
+            checkpoint=raw["checkpoint"],
+            a_entries=raw["a_entries"],
+            split_index=int(raw["split_index"]),
+            snapshot_len=int(raw["snapshot_len"]),
+            boundary_key=str(raw["boundary_key"]),
+            covered_event_ids=[str(i) for i in raw["covered_event_ids"]],
+            summary=raw.get("summary"),
+            tokens_before=int(raw["tokens_before"]),
+            archive=raw.get("archive"),
+            job_id=str(raw.get("job_id") or ""),
+            preemptive=bool(raw.get("preemptive")),
+            applied=bool(raw.get("applied")),
+            memory_status=str(raw.get("memory_status") or "pending"),
+            memory_wrote=bool(raw.get("memory_wrote")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning("prepared state malformed (%s); dropping", exc)
+        delete_prepared(config)
+        return None
+
+
+def delete_prepared(config: CompressionConfig) -> None:
+    try:
+        prepared_state_path(config).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("prepared state delete failed: %s", exc)
+
+
+def is_prepared_valid(entries: list[dict],
+                      prepared: PreparedCompression) -> bool:
+    """The snapshot boundary still lines up with the (append-only) context."""
+    if (prepared.split_index <= 0
+            or prepared.split_index > len(entries)
+            or len(entries) < prepared.snapshot_len):
+        return False
+    return _entry_key(entries[prepared.split_index - 1]) == prepared.boundary_key
+
+
+def _split_for_tool_pairs(entries: list[dict], split: int) -> int:
+    """B must never start with a tool result whose assistant tool_call got
+    summarized into A: move the boundary back to that assistant so calls and
+    results stay together (``sanitize_tool_messages`` would drop orphans)."""
+    while 0 < split < len(entries) and entries[split].get("role") == "tool":
+        split -= 1
+    return split
+
+
+def _split_snapshot(entries: list[dict], config: CompressionConfig,
+                    ) -> tuple[list[dict], int, list[dict], list[str]]:
+    """Blocking-path split: A = older part, B = newest whole rounds fitting
+    ``keep_recent_tokens`` + unconsumed tail. Returns
+    ``(a_entries, split_index, kept, covered_event_ids)``."""
     # 未消费尾部（最后一条 assistant 之后的条目）＝当前批次：模型还没看过。
     # 它属于 B，原样保留（带 event_id，_build_messages 按 id 去重）；只有
     # 超过 keep_recent_tokens 的超大尾部才展平进摘要（covered_event_ids）。
@@ -489,7 +618,7 @@ async def compress_context(context: ContextStore, llm: Any,
         pinned = tail
         prefix = entries[:len(entries) - len(tail)]
     if not prefix and not pinned:
-        return None
+        return [], 0, [], []
     tail_chars = 0
     for entry in pinned:
         tail_chars += len(text_of(entry.get("content") or ""))
@@ -507,35 +636,101 @@ async def compress_context(context: ContextStore, llm: Any,
     recent_budget_chars = int(config.keep_recent_tokens
                               * max(1.0, config.estimate_chars_per_token))
     recent = _trim_recent_by_chars(recent, recent_budget_chars)
-    a_entries = prefix[:len(prefix) - len(recent)]
-    kept = list(recent) + list(pinned)
+    # 边界不能落在 tool 结果上（邻近 tool 结果与请求它的 assistant 一起保留）
+    split = _split_for_tool_pairs(prefix, len(prefix) - len(recent))
+    a_entries = prefix[:split]
+    kept = list(prefix[split:]) + list(pinned)
+    kept_ids = {str(entry.get("event_id")) for entry in kept
+                if entry.get("event_id")}
+    covered = [i for i in covered_ids if str(i) not in kept_ids]
+    return a_entries, split, kept, covered
+
+
+async def prepare_compression(context: ContextStore, llm: Any,
+                              config: CompressionConfig,
+                              force: bool = False,
+                              total: Optional[int] = None,
+                              preemptive: bool = False,
+                              memory_runner: Optional[
+                                  Callable[[list[dict]], Any]] = None,
+                              ) -> Optional[PreparedCompression]:
+    """Run the summary on a snapshot WITHOUT touching the active context.
+
+    ``total`` lets a background precompression use the estimate captured
+    when it started. ``preemptive=True`` is the PRECOMPRESSION mode: the
+    whole current snapshot IS A (everything appended later is guaranteed to
+    belong to the future B, so it will never enter the compressor) and the
+    summary therefore equals the blocking path's output; the threshold
+    check is skipped. ``memory_runner(A)`` (optional) is invoked right
+    before the summary request, so memory extraction runs CONCURRENTLY with
+    it; its task is returned in the result but never awaited here — the
+    Agent only waits for the summary and pushes the reminder when memory
+    extraction finishes. Returns None when not triggered or when nothing
+    older than the kept window is compressible (non-preemptive mode).
+
+    A = the older part that is replaced by the summary; B = the most recent
+    WHOLE rounds that fit ``keep_recent_tokens`` plus the UNCONSUMED TAIL
+    (entries after the last assistant = the current batch the model has not
+    seen yet). B is kept VERBATIM after the checkpoint with its event_ids,
+    so ``_build_messages`` dedupes instead of re-appending it. An oversized
+    tail is flattened into the summary and its event ids recorded in the
+    checkpoint metadata (``covered_event_ids``); a raw-kept round whose
+    content exceeds the budget falls back into A as well."""
+    if total is None:
+        total = context.estimated_tokens(
+            config.estimate_chars_per_token, config.image_tokens_estimate)
+    if (not force and not preemptive
+            and total <= config.max_tokens * config.threshold):
+        return None
+    entries = context.load()
+    if not entries:
+        return None
+    # 末条是等待工具结果的 assistant：此刻切分会把 tool_call 与稍后追加的
+    # 结果拆开 → 等安全点（结果落盘后）再预压缩。
+    if (entries[-1].get("role") == "assistant"
+            and entries[-1].get("tool_calls")):
+        logger.info("compression deferred: assistant tool_calls awaiting "
+                    "results")
+        return None
+    if force and total <= config.max_tokens * config.threshold:
+        logger.info("forced compression requested (tokens=%d, below "
+                    "threshold)", total)
+    elif preemptive and total <= config.max_tokens * config.threshold:
+        logger.info("precompression running below the trigger line: "
+                    "tokens=%d", total)
+    else:
+        logger.info("compression triggered: tokens=%d > %d*%.2f",
+                    total, config.max_tokens, config.threshold)
+
+    if preemptive:
+        # 预压缩：A ＝ 当前整个快照（触发前新增的条目一定属于未来 B，
+        # 永远不会进压缩器）→ 与阻塞路径的摘要输入一致。快照边界就是切分点。
+        a_entries = list(entries)
+        split = len(entries)
+        kept: list[dict] = []
+        covered_ids: list[str] = []
+    else:
+        # 未消费尾部（最后一条 assistant 之后的条目）＝当前批次：模型还没看过。
+        # 它属于 B，原样保留（带 event_id，_build_messages 按 id 去重）；只有
+        # 超过 keep_recent_tokens 的超大尾部才展平进摘要（covered_event_ids）。
+        a_entries, split, kept, covered_ids = _split_snapshot(entries, config)
     if not a_entries and not covered_ids:
-        # 整个上下文都在 keep_recent 窗口内：没有「更早的 A」可压缩，
-        # 摘要 + 原样保留不会降低体积——跳过（避免写空检查点）。
+        # 没有可压缩的旧内容（全部都在 keep_recent 窗口内）→ 跳过
         logger.info("compression skipped: nothing older than the kept "
                     "recent window")
         return None
     archive = context.copy_archive(config.compressed_dir)
+    # 记忆提取与摘要同时触发（各自 retry/error）；只把 task 交给调用方，
+    # 这里绝不 await 它——阻塞只取决于摘要是否完成。
+    memory_task = None
+    if memory_runner is not None and a_entries:
+        memory_task = memory_runner(a_entries)
 
-    # 两步独立并行：记忆提取（只看 A）＋摘要（看整段上下文 A+B）。
-    # 提取失败不阻断；摘要重试耗尽时 fallback 结构化 checkpoint。
-    async def run_extract() -> None:
-        if config.memory and config.memory.enabled and a_entries:
-            await _with_retry(
-                "memory extraction",
-                lambda: extract_memory(llm, a_entries, config.memory,
-                                       config.max_input_chars,
-                                       memory_root=memory_root))
-
-    async def run_summarize() -> Optional[str]:
-        return await _with_retry(
-            "summarize",
-            lambda: summarize(llm, a_entries,
-                              config.summary_prompt_file,
-                              config.max_input_chars))
-
-    summary = (await asyncio.gather(
-        run_summarize(), run_extract()))[0]
+    summary = await _with_retry(
+        "summarize",
+        lambda: summarize(llm, a_entries,
+                          config.summary_prompt_file,
+                          config.max_input_chars))
     kept_ids = {str(entry.get("event_id")) for entry in kept
                 if entry.get("event_id")}
     covered = [i for i in covered_ids if str(i) not in kept_ids]
@@ -543,18 +738,87 @@ async def compress_context(context: ContextStore, llm: Any,
         # 重试耗尽：结构化 fallback checkpoint（不依赖 LLM 摘要）
         checkpoint = build_fallback_checkpoint(
             entries, total, covered_event_ids=covered)
-        logger.warning("summarize exhausted; fallback checkpoint used")
+        logger.warning("summarize exhausted; fallback checkpoint prepared")
     else:
         checkpoint = build_checkpoint_message(
             summary, total, covered_event_ids=covered,
             model=str(getattr(llm, "model", "") or ""))
-    # 归档是副本 + 原子写：这里失败原 context 仍完好，无需恢复逻辑。
-    # 重写为：checkpoint（整段摘要）+ B 原样条目（recent + 未消费尾部）。
-    context.write_all([checkpoint] + kept)
+    logger.info("compression prepared: archive=%s summary_of=%d A=%d "
+                "kept=%d covered=%d", archive, len(entries),
+                len(a_entries), len(kept), len(covered))
+    return PreparedCompression(
+        checkpoint=checkpoint,
+        a_entries=a_entries,
+        split_index=split,
+        snapshot_len=len(entries),
+        boundary_key=_entry_key(entries[split - 1]) if split > 0 else "",
+        covered_event_ids=covered,
+        summary=summary,
+        tokens_before=total,
+        archive=archive,
+        memory_task=memory_task,
+        preemptive=preemptive,
+    )
+
+
+def apply_prepared(context: ContextStore, prepared: PreparedCompression,
+                   ) -> bool:
+    """Swap a prepared checkpoint into the active context.
+
+    New entries appended after the snapshot are kept verbatim; entries that
+    were flattened into the checkpoint (``covered_event_ids``) are dropped
+    so they are not duplicated. Returns False (context untouched) when the
+    snapshot was invalidated by another rewrite."""
+    entries = context.load()
+    if not is_prepared_valid(entries, prepared):
+        logger.warning("prepared compression is stale (entries=%d split=%d "
+                       "snapshot=%d)", len(entries), prepared.split_index,
+                       prepared.snapshot_len)
+        return False
+    kept = entries[prepared.split_index:]
+    if prepared.covered_event_ids:
+        covered = {str(i) for i in prepared.covered_event_ids}
+        kept = [entry for entry in kept
+                if str(entry.get("event_id")) not in covered]
+    context.write_all([prepared.checkpoint] + kept)
     logger.info("context compressed: archive=%s summary_of=%d A=%d kept=%d "
-                "covered=%d", archive, len(entries), len(a_entries),
-                len(kept), len(covered))
-    return summary
+                "covered=%d", prepared.archive, prepared.snapshot_len,
+                len(prepared.a_entries), len(kept),
+                len(prepared.covered_event_ids))
+    return True
+
+
+async def run_memory_extraction(llm: Any, entries: list[dict],
+                                memory: MemoryConfig,
+                                max_input_chars: int = 0,
+                                memory_root: str = "") -> Optional[str]:
+    """Memory extraction with retries, run CONCURRENTLY with the summary
+    (never awaited by the swap). Returns the extracted text ('' when the
+    model produced nothing) or None when every attempt failed (the error is
+    logged by ``_with_retry``)."""
+    if not entries:
+        return ""
+    return await _with_retry(
+        "memory extraction",
+        lambda: extract_memory(llm, entries, memory, max_input_chars,
+                               memory_root=memory_root))
+
+
+async def compress_context(context: ContextStore, llm: Any,
+                           config: CompressionConfig,
+                           force: bool = False) -> Optional[str]:
+    """Synchronous convenience path: prepare + apply (no memory extraction).
+
+    ``force=True`` compresses even below the token threshold (manual tool /
+    byte-budget relief). When summarization fails a STRUCTURED fallback
+    checkpoint is applied so the context ALWAYS comes down. The archive is a
+    COPY and the rewrite is atomic, so a crash/kill at any point keeps the
+    active context intact (never archived away without a replacement).
+    """
+    prepared = await prepare_compression(context, llm, config, force=force)
+    if prepared is None or not apply_prepared(context, prepared):
+        return None
+    return prepared.summary
 
 
 def _trim_recent_by_chars(recent: list[dict], max_chars: int) -> list[dict]:

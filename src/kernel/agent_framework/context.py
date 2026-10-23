@@ -237,6 +237,23 @@ class ContextStore:
                 + int((chars + chars_per_token - 1) // chars_per_token)
                 + images * max(0, int(image_tokens)))
 
+    def content_tokens(self, chars_per_token: float,
+                       image_tokens: int = 0) -> int:
+        """Provider-usage-free footprint (text chars / ``chars_per_token``
+        + images * ``image_tokens``). Used right after a compression, when
+        the newest provider usage still describes the PRE-compression
+        context and would otherwise trigger the same compression again."""
+        if chars_per_token <= 0:
+            chars_per_token = 1.0
+        chars = 0
+        images = 0
+        for entry in self.load():
+            content = entry.get("content")
+            chars += _content_chars(content)
+            images += _content_images(content)
+        return (int((chars + chars_per_token - 1) // chars_per_token)
+                + images * max(0, int(image_tokens)))
+
     def repair_latest(self, n: int) -> tuple[int, int]:
         """Check the LATEST n entries; returns (repaired, dropped).
         Unparseable tail lines are dropped; valid-but-malformed entries are

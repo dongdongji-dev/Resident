@@ -381,8 +381,20 @@ compression:
   # 超限保留头尾、中间省略，保证压缩请求与压缩产物本身不超模型上限
   max_input_chars: 200000
   # 保留最近「刚好小于 keep_recent_tokens」的若干整轮为原文（不删、不序列化）；
-  # 摘要与记忆提取都只输入更早的、将被摘要替换的部分（这些整轮不进入二者输入）
+  # 阻塞压缩时摘要与记忆提取都只输入更早的、将被替换部分（这些整轮不进入二者
+  # 输入）；预压缩的提前量也等于该值。
   keep_recent_tokens: 16000
+  # 预压缩：只要上下文超过「触发线 - keep_recent_tokens」（A 点）就确保有一个
+  # 后台摘要任务（水平触发、幂等、启动时/重启后自动重建；此时 A＝当时整个上下文，
+  # 之后新增内容必属于 B、不会进压缩器），到触发线（A+B）才替换：已就绪直接换，
+  # 未就绪进入 COMPRESS 轮询；重启时若已越过触发线，则按阻塞切分重建（保留 B）。
+  # 后台失败回退同步压缩并记录 error。完成/进行中的状态持久化在
+  # <compressed_dir>/prepared.json（重启后校验边界复用，避免重复计费）。
+  # 记忆提取与摘要同时触发（各自重试/error）；是否阻塞只看摘要——替换完成即恢复，
+  # 整理提醒等记忆提取完成后再推送。
+  precompress: true
+  # 等待后台摘要时的轮询间隔（秒）
+  precompress_poll_seconds: 1.0
   summary_prompt_file: config/prompt/compression_summary.md
   # 压缩完成后的整理提醒模板（agent 收到的 user notice）：
   # {memory_file} 为记忆文件容器路径占位符；记忆不可用时该行整行省略。
