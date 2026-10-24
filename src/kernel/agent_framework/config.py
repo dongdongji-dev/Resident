@@ -15,6 +15,8 @@ from typing import Any
 
 import yaml
 
+from kernel.agent_framework.protocol import DEFAULT_SILENCE_MARKER
+
 
 class ConfigError(ValueError):
     """Raised when configuration is missing or malformed."""
@@ -284,6 +286,9 @@ class RuntimeConfig:
             require(raw, "agent.model_output_threshold_chars"))
         self.model_output_line_max_chars: int = int(
             require(raw, "agent.model_output_line_max_chars"))
+        # 静默标记（可配置常量；提示词 {{silence_marker}} 自动替换）
+        self.silence_marker: str = str(
+            get(raw, "agent.silence_marker", DEFAULT_SILENCE_MARKER))
         self.unread_window_hours: float = float(
             require(raw, "agent.unread_window_hours"))
         self.unread_max_per_session: int = int(

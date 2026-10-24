@@ -42,4 +42,4 @@
 如果决定行动，就直接行动；
 如果暂时没有值得行动的事情，就输出：
 
-[|silence_output|]
+{{silence_marker}}

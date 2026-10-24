@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from kernel.agent_framework.image_tools import READIMAGE_LABEL_TEMPLATE
-from kernel.agent_framework.protocol import SILENCE_MARKER
+from kernel.agent_framework.protocol import DEFAULT_SILENCE_MARKER
 from kernel.agent_framework.reboot import REBOOT_NOTICE_MESSAGE
 from kernel.agent_framework.sandbox import BACKGROUND_DONE_PREFIX
 from kernel.scheduler.beat import (NOT_CARRIED_HINT, NOTICE_ENVELOPE,
@@ -126,7 +126,8 @@ def build_runtime_block(config: dict[str, Any]) -> str:
     others = [
         f"- 重启完成：「{REBOOT_NOTICE_MESSAGE}」——表示运行环境重载完成，"
         "继续原有工作即可，不是新的指令；",
-        f"- 静默标记：没有需要对外说的话时，单独一行输出 `{SILENCE_MARKER}`；",
+        "- 静默标记：没有需要对外说的话时，单独一行输出 "
+        f"`{str((config.get('agent') or {}).get('silence_marker') or DEFAULT_SILENCE_MARKER)}`；",
     ]
     if readimage.get("enabled"):
         label_example = READIMAGE_LABEL_TEMPLATE.format(label="图片路径")

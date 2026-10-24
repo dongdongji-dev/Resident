@@ -19,6 +19,7 @@ import os
 from typing import Any, Callable, Optional
 
 from kernel.agent_framework.logging_setup import get_logger
+from kernel.agent_framework.protocol import DEFAULT_SILENCE_MARKER
 
 logger = get_logger("kernel.agent_framework.prompts")
 
@@ -82,15 +83,22 @@ def build_system_prompt(project_name: str, model: str,
                         prompt_dir: str, files: list[str],
                         tool_schemas: list[dict[str, Any]],
                         skills_dir: Optional[str] = None,
-                        runtime_block: Optional[str] = None) -> str:
+                        runtime_block: Optional[str] = None,
+                        silence_marker: str = DEFAULT_SILENCE_MARKER,
+                        ) -> str:
     """Assemble the full system prompt: header -> config files -> runtime
-    block (when provided) -> skills (when configured) -> tools."""
+    block (when provided) -> skills (when configured) -> tools. The
+    ``{{silence_marker}}`` placeholder in prompt files is replaced by the
+    configured marker so the docs always match the code constant."""
     parts: list[str] = []
     header = build_identity_header(project_name, model, user_dir)
     if header:
         parts.append(header)
     loaded = load_prompt_files(prompt_dir, files)
     if loaded:
+        loaded = loaded.replace("{{silence_marker}}",
+                                str(silence_marker
+                                    or DEFAULT_SILENCE_MARKER))
         parts.append(loaded)
     if runtime_block:
         parts.append(runtime_block)
@@ -111,7 +119,9 @@ def make_system_prompt_builder(
         prompt_dir: str, files: list[str],
         tool_schemas_provider: Callable[[], list[dict[str, Any]]],
         skills_dir: Optional[str] = None,
-        runtime_block: Optional[str] = None) -> Callable[[], str]:
+        runtime_block: Optional[str] = None,
+        silence_marker: str = DEFAULT_SILENCE_MARKER,
+        ) -> Callable[[], str]:
     """Return a callable that re-renders the full system prompt from the
     CURRENT registry state on every call.
 
@@ -125,6 +135,7 @@ def make_system_prompt_builder(
             project_name=project_name, model=model, user_dir=user_dir,
             prompt_dir=prompt_dir, files=files,
             tool_schemas=list(tool_schemas_provider()),
-            skills_dir=skills_dir, runtime_block=runtime_block)
+            skills_dir=skills_dir, runtime_block=runtime_block,
+            silence_marker=silence_marker)
 
     return build

@@ -57,7 +57,8 @@ from kernel.agent_framework.llm.base import (LLMClient, LLMResult,
                                              LLMPermanentError,
                                              RequestTooLargeError, ToolCall)
 from kernel.agent_framework.logging_setup import get_logger
-from kernel.agent_framework.protocol import (append_trailing_empty_user,
+from kernel.agent_framework.protocol import (DEFAULT_SILENCE_MARKER,
+                                             append_trailing_empty_user,
                                              is_silence_output,
                                              merge_user_events,
                                              sanitize_tool_messages)
@@ -104,6 +105,7 @@ class Agent:
         wake_min_probability: Optional[float] = None,
         model_output_threshold_chars: Optional[int] = None,
         model_output_line_max_chars: Optional[int] = None,
+        silence_marker: str = DEFAULT_SILENCE_MARKER,
         truncated_dir: str = "",
         context_max_bytes: int = 0,
         llm_failed_backoff_seconds: float = 0.0,
@@ -164,6 +166,8 @@ class Agent:
         self.model_output_line_max_chars = (
             int(model_output_line_max_chars)
             if model_output_line_max_chars is not None else None)
+        self.silence_marker = str(silence_marker
+                                  or DEFAULT_SILENCE_MARKER)
         self.truncated_dir = truncated_dir
         self.context_max_bytes = max(0, int(context_max_bytes or 0))
         # 工具结果通用上限（0=不限制）：工具自身漏掉截断时的兜底
@@ -664,7 +668,7 @@ class Agent:
                 or self.model_output_threshold_chars is None):
             return
         text = str(text or "")
-        if not text or is_silence_output(text):
+        if not text or is_silence_output(text, self.silence_marker):
             # 空输出 / 静默标记：不计入自说自话字数
             return
         if not self._free_text_active():

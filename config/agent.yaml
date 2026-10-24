@@ -63,6 +63,9 @@ agent:
   model_output_threshold_chars: 800
   # 自说自话提醒中每条内容截断的字符数（[1]string[:x]）
   model_output_line_max_chars: 100
+  # 静默标记（可配置常量）：模型无话可说时输出该标记（或空输出）。
+  # 提示词与日程文件里的 {{silence_marker}} 会替换为该值（改这里全局生效）。
+  silence_marker: "[|silence_output|]"
   # 未读统计窗口（小时）：窗口外的未读视为已读（不携带、不统计、不唤醒）
   unread_window_hours: 1
   # 每会话未读上限：超过该数量之前的未读视为已读（防历史积压反复打扰）

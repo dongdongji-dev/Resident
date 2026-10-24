@@ -165,6 +165,7 @@ def build_agent(config: dict,
         files=rc.prompt_files,
         tool_schemas_provider=registry.schemas,
         skills_dir=rc.skills_directory if rc.skills_enabled else None,
+        silence_marker=rc.silence_marker,
     )
 
     compression_cfg = load_compression_config(config)
@@ -200,6 +201,7 @@ def build_agent(config: dict,
         wake_min_probability=rc.wake_min_probability,
         model_output_threshold_chars=rc.model_output_threshold_chars,
         model_output_line_max_chars=rc.model_output_line_max_chars,
+        silence_marker=rc.silence_marker,
         context_max_bytes=rc.context_max_bytes,
         llm_failed_backoff_seconds=rc.llm_failed_backoff_seconds,
         llm_permanent_fail_threshold=rc.llm_permanent_fail_threshold,

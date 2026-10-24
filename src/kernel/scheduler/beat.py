@@ -114,6 +114,8 @@ class BeatConfig:
     # 通知还没被合并）时，不再重复完整唤醒，只补推新到的（有人找你）消息
     wake_supplement_prefix: str
     no_message_prompt_file: str
+    # 静默标记（agent.silence_marker）：日程提示词里的占位符按它渲染
+    silence_marker: str
 
 
 def load_beat_config(config: dict) -> BeatConfig:
@@ -142,6 +144,8 @@ def load_beat_config(config: dict) -> BeatConfig:
         wake_notice_prefix=str(wake["wake_notice_prefix"]),
         wake_supplement_prefix=str(wake["wake_supplement_prefix"]),
         no_message_prompt_file=str(wake["no_message_prompt_file"]),
+        silence_marker=str((config.get("agent") or {}).get(
+            "silence_marker") or "[|silence_output|]"),
     )
 
 
@@ -867,10 +871,12 @@ class Beat:
     def _load_no_message_prompt(self) -> str:
         path = Path(self._config.no_message_prompt_file)
         try:
-            return path.read_text(encoding="utf-8").strip()
+            text = path.read_text(encoding="utf-8").strip()
         except OSError as exc:
             logger.warning("no-message prompt missing: %s", path)
             return f"（主动唤醒，但提示文件缺失: {path}）"
+        return text.replace("{{silence_marker}}",
+                            self._config.silence_marker)
 
     def _flush_notices(self) -> None:
         """Deliver due notices to the Agent: EVERY due notice becomes its

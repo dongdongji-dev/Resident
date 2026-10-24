@@ -20,16 +20,19 @@ from kernel.agent_framework.events import Event
 
 # 静默协议：模型"无话可说"时输出该标记（或空输出）。Agent 识别后
 # 不把内容计入 model_output 自说自话（概率衰减由 agent 线程按
-# "无工具调用"处理，silence 是其子集）。
-SILENCE_MARKER = "[|silence_output|]"
+# "无工具调用"处理，silence 是其子集）。标记是部署常量：
+# config ``agent.silence_marker``（提示词里的 {{silence_marker}} 会同步替换）。
+DEFAULT_SILENCE_MARKER = "[|silence_output|]"
 
 
-def is_silence_output(text: str) -> bool:
-    """True when a final assistant output means "stay silent": the silence
-    marker appears anywhere (the model may attach a short confirmation
-    before it) or the output is completely empty."""
+def is_silence_output(text: str,
+                      marker: str = DEFAULT_SILENCE_MARKER) -> bool:
+    """True when a final assistant output means "stay silent": the
+    configured silence marker appears anywhere (the model may attach a
+    short confirmation before it) or the output is completely empty."""
+    marker = str(marker or DEFAULT_SILENCE_MARKER)
     stripped = str(text or "").strip()
-    return stripped == "" or SILENCE_MARKER in stripped
+    return stripped == "" or marker in stripped
 
 
 def sanitize_tool_messages(messages: list[dict]) -> list[dict]:
