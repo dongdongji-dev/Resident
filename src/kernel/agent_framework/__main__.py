@@ -101,12 +101,6 @@ def build_agent(config: dict,
     llm = create_llm_client(llm_config)
     registry = ToolRegistry()
 
-    async def echo(text: str) -> str:
-        """回显消息（框架自带的示例工具，用于验证 ReAct 循环）。"""
-        return text
-
-    registry.register("echo", echo, description="echo the given text back")
-
     # 数据层（os.db）：exec_async 完成通知等需要 notices
     messages = MessagesStore(db)
     notices = NoticeStore(db)
